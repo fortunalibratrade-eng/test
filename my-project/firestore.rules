@@ -1,0 +1,103 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper: pastikan yang akses adalah pemilik data ──
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    // ── Validasi skema TRANSAKSI ──
+    function isValidTxn(d) {
+      return d.keys().hasAll(['date','description','amount','categoryId','accountId','type'])
+        && d.type in ['income','expense']
+        && d.amount is number && d.amount > 0 && d.amount < 999999999999
+        && d.description is string && d.description.size() <= 200
+        && d.date is string && d.date.size() == 10
+        && d.categoryId is string && d.categoryId.size() > 0
+        && d.accountId  is string && d.accountId.size() > 0
+        && (!('note' in d) || (d.note is string && d.note.size() <= 300))
+        && (!('transferId' in d) || d.transferId is string);
+    }
+
+    // ── Validasi skema ANGGARAN ──
+    function isValidBudget(d) {
+      return d.keys().hasAll(['categoryId','amount'])
+        && d.categoryId is string && d.categoryId.size() > 0
+        && d.amount is number && d.amount > 0 && d.amount < 999999999999;
+    }
+
+    // ── Validasi skema TARGET TABUNGAN ──
+    function isValidGoal(d) {
+      return d.keys().hasAll(['name','target','current','deadline','icon','color'])
+        && d.name is string && d.name.size() > 0 && d.name.size() <= 60
+        && d.target  is number && d.target  > 0
+        && d.current is number && d.current >= 0
+        && d.deadline is string
+        && d.icon  is string
+        && d.color is string;
+    }
+
+    // ── Validasi skema KATEGORI ──
+    function isValidCategory(d) {
+      return d.keys().hasAll(['name','type','icon','color'])
+        && d.name is string && d.name.size() > 0 && d.name.size() <= 40
+        && d.type in ['income','expense']
+        && d.icon  is string
+        && d.color is string;
+    }
+
+    // ── Validasi skema AKUN ──
+    function isValidAccount(d) {
+      return d.keys().hasAll(['name','type','icon','color'])
+        && d.name is string && d.name.size() > 0 && d.name.size() <= 50
+        && d.type in ['cash','bank','ewallet']
+        && d.icon  is string
+        && d.color is string;
+    }
+
+    match /users/{userId} {
+
+      match /transactions/{txnId} {
+        allow read:          if isOwner(userId);
+        allow create, update:if isOwner(userId) && isValidTxn(request.resource.data);
+        allow delete:        if isOwner(userId);
+      }
+
+      match /budgets/{budId} {
+        allow read:          if isOwner(userId);
+        allow create, update:if isOwner(userId) && isValidBudget(request.resource.data);
+        allow delete:        if isOwner(userId);
+      }
+
+      match /goals/{goalId} {
+        allow read:          if isOwner(userId);
+        allow create, update:if isOwner(userId) && isValidGoal(request.resource.data);
+        allow delete:        if isOwner(userId);
+      }
+
+      match /categories/{catId} {
+        allow read:          if isOwner(userId);
+        allow create, update:if isOwner(userId) && isValidCategory(request.resource.data);
+        allow delete:        if isOwner(userId);
+      }
+
+      match /accounts/{accId} {
+        allow read:          if isOwner(userId);
+        allow create, update:if isOwner(userId) && isValidAccount(request.resource.data);
+        allow delete:        if isOwner(userId);
+      }
+
+      // Settings cuma berisi { theme, currency } — risiko rendah, cukup cek kepemilikan
+      match /settings/{settingId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // Default-deny mutlak: koleksi/dokumen di luar whitelist di atas
+    // (termasuk subcollection tak dikenal di bawah /users/{userId}) ditolak total.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

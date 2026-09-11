@@ -1,0 +1,22 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Node (kalau nanti pakai tooling build/lint)
+node_modules/
+npm-debug.log*
+
+# Firebase local
+.firebase/
+firebase-debug.log
+firestore-debug.log
+*.local
+
+# Env / secrets (jaga-jaga, meski apiKey Firebase client memang publik)
+.env
+.env.local
