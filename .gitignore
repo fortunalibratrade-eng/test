@@ -20,4 +20,6 @@ firestore-debug.log
 # Env / secrets (jaga-jaga, meski apiKey Firebase client memang publik)
 .env
 .env.local
+
+# Archives
 *.zip

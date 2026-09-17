@@ -17,7 +17,9 @@ service cloud.firestore {
         && d.categoryId is string && d.categoryId.size() > 0
         && d.accountId  is string && d.accountId.size() > 0
         && (!('note' in d) || (d.note is string && d.note.size() <= 300))
-        && (!('transferId' in d) || d.transferId is string);
+        && (!('transferId' in d) || d.transferId is string)
+        && (!('flow' in d) || d.flow in ['real','hutang','transfer'])
+        && (!('debtId' in d) || d.debtId is string);
     }
 
     // ── Validasi skema ANGGARAN ──
@@ -56,6 +58,31 @@ service cloud.firestore {
         && d.color is string;
     }
 
+    // ── Validasi skema HUTANG / PIUTANG ──
+    // Catatan: update() untuk pencatatan pembayaran hanya mengirim field {paid},
+    // jadi validasi tidak mewajibkan hasAll saat field lain tidak dikirim ulang.
+    function isValidDebt(d) {
+      return (!('type' in d)   || d.type in ['hutang','piutang'])
+        && (!('person' in d)   || (d.person is string && d.person.size() > 0 && d.person.size() <= 60))
+        && (!('amount' in d)   || (d.amount is number && d.amount > 0 && d.amount < 999999999999))
+        && (!('paid' in d)     || (d.paid is number && d.paid >= 0 && d.paid < 999999999999))
+        && (!('dueDate' in d)  || d.dueDate == null || d.dueDate is string)
+        && (!('note' in d)     || (d.note is string && d.note.size() <= 200));
+    }
+
+    // ── Validasi skema TARGET BERKALA ──
+    // Catatan: toggle checklist mengirim update parsial {completedPeriods},
+    // jadi sama seperti debt, validasi bersifat per-field (bukan hasAll penuh).
+    function isValidTarget(d) {
+      return (!('period' in d) || d.period in ['harian','bulanan','tahunan'])
+        && (!('mode' in d)     || d.mode in ['nominal','checklist'])
+        && (!('title' in d)    || (d.title is string && d.title.size() > 0 && d.title.size() <= 60))
+        && (!('description' in d) || (d.description is string && d.description.size() <= 150))
+        && (!('goalType' in d) || d.goalType in ['hemat','batas'])
+        && (!('amount' in d)   || (d.amount is number && d.amount > 0 && d.amount < 999999999999))
+        && (!('completedPeriods' in d) || d.completedPeriods is list);
+    }
+
     match /users/{userId} {
 
       match /transactions/{txnId} {
@@ -85,6 +112,18 @@ service cloud.firestore {
       match /accounts/{accId} {
         allow read:          if isOwner(userId);
         allow create, update:if isOwner(userId) && isValidAccount(request.resource.data);
+        allow delete:        if isOwner(userId);
+      }
+
+      match /debts/{debtId} {
+        allow read:          if isOwner(userId);
+        allow create, update:if isOwner(userId) && isValidDebt(request.resource.data);
+        allow delete:        if isOwner(userId);
+      }
+
+      match /targets/{targetId} {
+        allow read:          if isOwner(userId);
+        allow create, update:if isOwner(userId) && isValidTarget(request.resource.data);
         allow delete:        if isOwner(userId);
       }
 
