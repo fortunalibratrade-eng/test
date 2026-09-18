@@ -29,15 +29,17 @@ service cloud.firestore {
         && d.amount is number && d.amount > 0 && d.amount < 999999999999;
     }
 
-    // ── Validasi skema TARGET TABUNGAN ──
+    // ── Validasi skema TARGET TABUNGAN / IMPIAN (termasuk Tangga Kekayaan Abadi) ──
     function isValidGoal(d) {
       return d.keys().hasAll(['name','target','current','deadline','icon','color'])
         && d.name is string && d.name.size() > 0 && d.name.size() <= 60
-        && d.target  is number && d.target  > 0
+        && d.target  is number && d.target  >= 0
         && d.current is number && d.current >= 0
         && d.deadline is string
         && d.icon  is string
-        && d.color is string;
+        && d.color is string
+        && (!('ladderStep' in d) || (d.ladderStep is number && d.ladderStep >= 1 && d.ladderStep <= 7))
+        && (!('autoTrack' in d) || d.autoTrack is bool);
     }
 
     // ── Validasi skema KATEGORI ──
@@ -67,7 +69,8 @@ service cloud.firestore {
         && (!('amount' in d)   || (d.amount is number && d.amount > 0 && d.amount < 999999999999))
         && (!('paid' in d)     || (d.paid is number && d.paid >= 0 && d.paid < 999999999999))
         && (!('dueDate' in d)  || d.dueDate == null || d.dueDate is string)
-        && (!('note' in d)     || (d.note is string && d.note.size() <= 200));
+        && (!('note' in d)     || (d.note is string && d.note.size() <= 200))
+        && (!('isKPR' in d)    || d.isKPR is bool);
     }
 
     // ── Validasi skema TARGET BERKALA ──

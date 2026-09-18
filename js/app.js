@@ -237,17 +237,102 @@ function netWorth() { return totalBal() + totalPiutang() - totalHutang(); }
 function isRealFlow(t) { return t.flow !== 'hutang' && t.flow !== 'transfer'; }
 function filterReal(arr) { return arr.filter(isRealFlow); }
 
-// Kategori khusus utk transaksi arus-kas hutang/piutang — dibuat otomatis
-// sekali saja per akun user (lazy-create), supaya user lama pun ikut dapat
-// tanpa perlu migrasi manual.
-async function ensureDebtCategory(type) {
-  let cat = S.categories.find(c => c.name === 'Hutang/Piutang' && c.type === type);
+// Kategori khusus (lazy-create) — dibuat otomatis sekali saja per akun user,
+// supaya user lama pun ikut dapat tanpa perlu migrasi manual.
+async function ensureCategoryByName(name, type, icon, color) {
+  let cat = S.categories.find(c => c.name === name && c.type === type);
   if (cat) return cat;
-  const icon = 'fa-hand-holding-dollar', color = '#8A90A8';
-  const ref = await addDoc(col('categories'), { name:'Hutang/Piutang', type, icon, color });
-  cat = { id: ref.id, name:'Hutang/Piutang', type, icon, color };
+  icon = icon || 'fa-tag'; color = color || '#8A90A8';
+  const ref = await addDoc(col('categories'), { name, type, icon, color });
+  cat = { id: ref.id, name, type, icon, color };
   S.categories.push(cat);
   return cat;
+}
+async function ensureDebtCategory(type) {
+  return ensureCategoryByName('Hutang/Piutang', type, 'fa-hand-holding-dollar', '#8A90A8');
+}
+
+/* ═══════════════════════════════════════════
+   TANGGA KEKAYAAN ABADI (Wealth Ladder)
+   7 tahap financial freedom. SETIAP status di sini dihitung LANGSUNG
+   dari data transaksi/hutang/tabungan yang sudah ada — TIDAK ADA status
+   yang bisa ditandai "selesai" hanya dengan klik. Tombol "Update" pada
+   tiap tangga hanya memicu perhitungan ulang (recheck), bukan klaim manual.
+═══════════════════════════════════════════ */
+const LADDER_META = [
+  { step:1, title:'Nabung Cash 10 Juta',              icon:'fa-piggy-bank',        color:'#8A90A8' },
+  { step:2, title:'Lunasi Semua Hutang Kecil',        icon:'fa-hand-holding-dollar', color:'#B08D57' },
+  { step:3, title:'Dana Darurat 3× Pengeluaran Bulanan', icon:'fa-shield-halved',  color:'#3DDBA0' },
+  { step:4, title:'Investasi Minimal 20% dari Income', icon:'fa-chart-line',       color:'#22D3EE' },
+  { step:5, title:'Dana Pendidikan Anak',             icon:'fa-graduation-cap',   color:'#A78BFA' },
+  { step:6, title:'Lunasi KPR Secepat Mungkin',       icon:'fa-house',            color:'#FFB830' },
+  { step:7, title:'Kekayaan Abadi & Berbagi',         icon:'fa-crown',            color:'#3DDBA0' },
+];
+
+// Rata-rata pengeluaran RIIL 3 bulan terakhir — dipakai sbg dasar target Dana Darurat (tangga 3)
+function avgMonthlyRealExpense() {
+  const m = [filterReal(monthTxns(1)), filterReal(monthTxns(2)), filterReal(monthTxns(3))].map(a => sumType(a,'expense'));
+  const valid = m.filter(v=>v>0);
+  return valid.length ? valid.reduce((s,v)=>s+v,0)/valid.length : sumType(filterReal(monthTxns(0)),'expense');
+}
+
+// Hasil selalu dihitung ULANG dari data asli setiap kali dipanggil — inilah "sinkron"-nya.
+function computeLadderProgress(g) {
+  const step = g.ladderStep;
+  if (step === 1) {
+    const actual = totalBal();
+    const target = g.target || 10000000;
+    return { actual, target, pct: Math.min(Math.max(actual/target,0)*100,100), done: actual >= target,
+      detail: `Total saldo semua akun Anda saat ini: ${fmt(actual)}.` };
+  }
+  if (step === 2) {
+    const list = S.debts.filter(d => d.type==='hutang' && !d.isKPR);
+    if (!list.length) return { actual:1, target:1, pct:100, done:true, detail:'Tidak ada catatan hutang kecil tercatat — dianggap bebas hutang kecil.' };
+    const totalAmt = list.reduce((s,d)=>s+d.amount,0);
+    const totalPaid = list.reduce((s,d)=>s+Math.min(d.paid||0,d.amount),0);
+    const done = list.every(d => debtRemaining(d) <= 0);
+    return { actual: totalPaid, target: totalAmt, pct: totalAmt>0?(totalPaid/totalAmt*100):100, done,
+      detail: `Terbayar ${fmt(totalPaid)} dari ${fmt(totalAmt)} total hutang kecil (${list.filter(d=>debtRemaining(d)<=0).length}/${list.length} lunas).` };
+  }
+  if (step === 3) {
+    const target = Math.round(avgMonthlyRealExpense() * 3);
+    const actual = g.current || 0;
+    return { actual, target: target||g.target||1, pct: target>0?Math.min(actual/target*100,100):0, done: target>0 && actual>=target,
+      detail: `Target dihitung otomatis: 3× rata-rata pengeluaran riil bulanan Anda (${fmt(target)}). Tabungan darurat terkumpul: ${fmt(actual)}.` };
+  }
+  if (step === 4) {
+    const cat = S.categories.find(c=>c.name==='Investasi' && c.type==='expense');
+    if (!cat) return { actual:0, target:20, pct:0, done:false, needsCategory:true,
+      detail:'Belum ada kategori pengeluaran "Investasi". Buat dulu supaya bisa dilacak otomatis dari transaksi Anda.' };
+    const lm = filterReal(monthTxns(1));
+    const invested = lm.filter(t=>t.categoryId===cat.id).reduce((s,t)=>s+t.amount,0);
+    const income = sumType(lm,'income');
+    const ratio = income>0 ? (invested/income*100) : 0;
+    return { actual: Math.round(ratio*10)/10, target: 20, pct: Math.min(ratio/20*100,100), done: income>0 && ratio>=20,
+      detail: income>0 ? `Bulan lalu Anda alokasikan ${fmt(invested)} untuk investasi dari ${fmt(income)} pendapatan riil (${ratio.toFixed(1)}%).` : 'Belum ada data pendapatan bulan lalu untuk dihitung rasionya.' };
+  }
+  if (step === 5) {
+    const target = g.target || 0;
+    const actual = g.current || 0;
+    if (!target) return { actual, target:0, pct:0, done:false, needsTarget:true, detail:'Set dulu target dana pendidikan anak lewat tombol Edit pada tangga ini.' };
+    return { actual, target, pct: Math.min(actual/target*100,100), done: actual>=target,
+      detail: `Dana pendidikan anak terkumpul ${fmt(actual)} dari target ${fmt(target)}.` };
+  }
+  if (step === 6) {
+    const kpr = S.debts.find(d => d.id === S.settings.wealthLadder?.kprDebtId);
+    if (S.settings.wealthLadder?.hasKPR === false) return { actual:1, target:1, pct:100, done:true, detail:'Anda menandai tidak memiliki KPR — tangga ini otomatis terpenuhi.' };
+    if (!kpr) return { actual:0, target:1, pct:0, done:false, needsKpr:true, detail:'Tandai salah satu Hutang Anda sebagai KPR di halaman Hutang & Piutang, atau tandai "Tidak punya KPR" di Pengaturan.' };
+    const remaining = debtRemaining(kpr);
+    const paid = Math.min(kpr.paid||0, kpr.amount);
+    return { actual: paid, target: kpr.amount, pct: kpr.amount>0?(paid/kpr.amount*100):100, done: remaining<=0,
+      detail: `KPR "${esc(kpr.person)}": terbayar ${fmt(paid)} dari ${fmt(kpr.amount)}.` };
+  }
+  // step 7 — puncak: tercapai kalau tangga 1-6 semua tercapai
+  const prior = S.goals.filter(x => x.ladderStep >= 1 && x.ladderStep <= 6);
+  const doneCount = prior.filter(x => computeLadderProgress(x).done).length;
+  const done = prior.length>0 && doneCount === prior.length;
+  return { actual: doneCount, target: prior.length||6, pct: prior.length?doneCount/prior.length*100:0, done,
+    detail: done ? 'Selamat! Semua tangga fondasi sudah tercapai. Ini puncaknya — kekayaan abadi & berbagi.' : `${doneCount}/${prior.length} tangga fondasi sudah tercapai. Teruskan!` };
 }
 
 // ── Target Berkala: kunci periode berjalan (dipakai utk cek "sudah selesai periode ini?") ──
@@ -824,6 +909,7 @@ const NAV = [
   {id:'goals',icon:'fa-bullseye',label:'Impian & Tabungan'},
   {id:'targets',icon:'fa-list-check',label:'Target Berkala'},
   {id:'reports',icon:'fa-chart-pie',label:'Laporan'},
+  {id:'aireport',icon:'fa-brain',label:'Laporan AI'},
   {id:'settings',icon:'fa-gear',label:'Pengaturan'}
 ];
 
@@ -925,6 +1011,7 @@ function renderPage() {
     case 'goals':        rGoal(el);    break;
     case 'targets':      rTargets(el); break;
     case 'reports':      rRep(el);     break;
+    case 'aireport':     rAIReport(el); break;
     case 'settings':     rSet(el);     break;
   }
   setTimeout(renderCharts, 80);
@@ -1077,6 +1164,123 @@ function renderAIAnalysis() {
     ${a.risks.length?`<div class="ai-section-title"><i class="fa-solid fa-triangle-exclamation" style="color:var(--expense)"></i> RISIKO</div>${a.risks.map(s=>`<div class="ai-insight risk"><i class="fa-solid fa-exclamation"></i><span>${s}</span></div>`).join('')}`:''}
     ${a.tips.length?`<div class="ai-section-title"><i class="fa-solid fa-lightbulb" style="color:var(--gold)"></i> REKOMENDASI</div>${a.tips.map(s=>`<div class="ai-insight tip"><i class="fa-solid fa-arrow-right"></i><span>${s}</span></div>`).join('')}`:''}
   </div>`;
+}
+
+/* ═══════════════════════════════════════════
+   LAPORAN AI — analisis penuh + rekap + saran prioritas
+   Menyatukan SEMUA data yang sudah sinkron: transaksi riil (filterReal),
+   hutang/piutang, anggaran, dan progres Tangga Kekayaan Abadi.
+═══════════════════════════════════════════ */
+function computeFullAIReport() {
+  const base = computeAIAnalysis(); // skor, grade, strengths/risks/tips inti
+
+  // ── Rekap periode (bulan berjalan) ──
+  const tm = filterReal(monthTxns(0));
+  const txCount = tm.length;
+  const catTotals = {};
+  tm.filter(t=>t.type==='expense').forEach(t => { const c=catObj(t.categoryId); catTotals[c.name]=(catTotals[c.name]||0)+t.amount; });
+  const topCatEntries = Object.entries(catTotals).sort((a,b)=>b[1]-a[1]);
+  const topCat = topCatEntries[0] || null;
+
+  const lastMonthNW = (() => {
+    // Kekayaan bersih bulan lalu: estimasi dari saldo dikurangi transaksi bulan ini (kasar, tapi cukup utk tren)
+    const thisMonthNet = sumType(tm,'income') - sumType(tm,'expense');
+    return netWorth() - thisMonthNet;
+  })();
+  const nwChange = netWorth() - lastMonthNW;
+
+  // ── Hutang/Piutang ──
+  const hutang = totalHutang(), piutang = totalPiutang();
+  const overdue = S.debts.filter(d => d.dueDate && d.dueDate < today() && debtRemaining(d) > 0);
+
+  // ── Tangga Kekayaan Abadi ──
+  const ladderGoals = S.goals.filter(g=>g.ladderStep).sort((a,b)=>a.ladderStep-b.ladderStep);
+  const ladderProgress = ladderGoals.map(g => ({ g, p: computeLadderProgress(g) }));
+  const currentRung = ladderProgress.find(x => !x.p.done); // tangga pertama yang belum tercapai
+
+  // ── Rekomendasi prioritas (diurutkan berdasar urgensi nyata) ──
+  const priorities = [];
+  if (overdue.length) {
+    priorities.push({ level:'urgent', icon:'fa-triangle-exclamation',
+      text: `${overdue.length} hutang/piutang sudah lewat jatuh tempo (total ${fmt(overdue.reduce((s,d)=>s+debtRemaining(d),0))}). Segera tindak lanjuti.` });
+  }
+  if (base.savingsRate < 0) {
+    priorities.push({ level:'urgent', icon:'fa-circle-exclamation',
+      text: 'Pengeluaran riil melebihi pendapatan bulan ini. Prioritaskan menekan pengeluaran sebelum menambah komitmen baru.' });
+  }
+  if (hutang > 0 && hutang > piutang) {
+    priorities.push({ level:'high', icon:'fa-hand-holding-dollar',
+      text: `Hutang (${fmt(hutang)}) lebih besar dari piutang (${fmt(piutang)}). Pertimbangkan melunasi hutang berbunga tinggi lebih dulu sebelum menambah tabungan/investasi baru.` });
+  }
+  if (currentRung) {
+    priorities.push({ level:'medium', icon: currentRung.g.icon,
+      text: `Fokus Tangga Kekayaan Abadi Anda saat ini: "${esc(currentRung.g.name.replace(/^Tangga \d+: /,''))}" — ${currentRung.p.detail}` });
+  }
+  if (base.tips.length) priorities.push({ level:'medium', icon:'fa-lightbulb', text: base.tips[0] });
+  if (!priorities.length) priorities.push({ level:'good', icon:'fa-thumbs-up', text:'Tidak ada isu mendesak terdeteksi. Pertahankan kebiasaan mencatat transaksi secara rutin.' });
+
+  return { ...base, txCount, topCat, nwChange, hutang, piutang, overdue, ladderProgress, currentRung, priorities };
+}
+
+function rAIReport(el) {
+  const r = computeFullAIReport();
+  const lvColor = { urgent:'var(--expense)', high:'#FB923C', medium:'var(--gold)', good:'var(--income)' };
+  const lvBg    = { urgent:'var(--expense-l)', high:'rgba(251,146,60,0.12)', medium:'var(--gold-l)', good:'var(--income-l)' };
+
+  el.innerHTML = `
+  <div style="margin-bottom:18px">
+    <h3 style="font-size:17px;font-weight:700"><i class="fa-solid fa-brain" style="color:var(--acc);margin-right:8px"></i>Laporan AI</h3>
+    <p style="font-size:12.5px;color:var(--tx2);margin-top:3px">Analisis menyeluruh & rekomendasi — disinkronkan dari transaksi riil, hutang/piutang, anggaran, dan Tangga Kekayaan Abadi</p>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <h4 style="font-size:13px;font-weight:800;letter-spacing:.4px;margin-bottom:12px;color:var(--tx2)">🎯 REKOMENDASI PRIORITAS</h4>
+    ${r.priorities.map(p => `<div style="display:flex;gap:11px;align-items:flex-start;padding:11px 13px;border-radius:10px;margin-bottom:8px;background:${lvBg[p.level]}">
+      <i class="fa-solid ${p.icon}" style="color:${lvColor[p.level]};margin-top:2px;flex-shrink:0"></i>
+      <span style="font-size:12.5px;color:var(--tx);line-height:1.5">${p.text}</span>
+    </div>`).join('')}
+  </div>
+
+  <div class="grid-4" style="margin-bottom:16px">
+    <div class="card"><div class="stat-label">Transaksi Bulan Ini</div><div class="stat-value" style="font-size:20px">${r.txCount}</div></div>
+    <div class="card"><div class="stat-label">Kategori Terbesar</div><div class="stat-value" style="font-size:16px;color:var(--expense)">${r.topCat?esc(r.topCat[0]):'—'}</div><span class="stat-change trend-neu">${r.topCat?fmt(r.topCat[1]):'Belum ada data'}</span></div>
+    <div class="card"><div class="stat-label">Perubahan Kekayaan Bersih</div><div class="stat-value" style="font-size:18px;color:${r.nwChange>=0?'var(--income)':'var(--expense)'}">${r.nwChange>=0?'+':''}${fmt(r.nwChange)}</div><span class="stat-change trend-neu">vs awal bulan</span></div>
+    <div class="card"><div class="stat-label">Hutang vs Piutang</div><div class="stat-value" style="font-size:16px"><span style="color:var(--expense)">${fmtS(r.hutang)}</span> / <span style="color:var(--income)">${fmtS(r.piutang)}</span></div></div>
+  </div>
+
+  <div id="ai-full-analysis-wrap" style="margin-bottom:16px"></div>
+
+  ${r.ladderProgress.length ? `
+  <div class="card" style="margin-bottom:16px">
+    <h4 style="font-size:13px;font-weight:800;letter-spacing:.4px;margin-bottom:12px;color:var(--tx2)"><i class="fa-solid fa-crown" style="color:var(--gold);margin-right:5px"></i>PROGRES TANGGA KEKAYAAN ABADI</h4>
+    <div style="display:flex;flex-wrap:wrap;gap:8px">
+      ${r.ladderProgress.map(({g,p}) => `<div title="${esc(p.detail)}" style="flex:1;min-width:90px;text-align:center;padding:10px 6px;border-radius:10px;background:${p.done?'var(--income-l)':'var(--bg2)'};border:1px solid var(--border)">
+        <div style="font-family:'Outfit';font-weight:800;font-size:15px;color:${p.done?'var(--income)':'var(--tx2)'}">${g.ladderStep}</div>
+        <div style="font-size:9.5px;color:var(--txm);margin-top:2px">${p.pct.toFixed(0)}%</div>
+      </div>`).join('')}
+    </div>
+  </div>` : `
+  <div class="card" style="margin-bottom:16px;text-align:center">
+    <i class="fa-solid fa-crown" style="color:var(--gold);font-size:22px;margin-bottom:8px;display:block"></i>
+    <p style="font-size:12.5px;color:var(--tx2);margin-bottom:10px">Anda belum mengaktifkan Template Kekayaan Abadi.</p>
+    <button class="btn btn-primary btn-sm" onclick="nav('settings')">Aktifkan di Pengaturan</button>
+  </div>`}
+
+  ${r.overdue.length ? `
+  <div class="card">
+    <h4 style="font-size:13px;font-weight:800;letter-spacing:.4px;margin-bottom:12px;color:var(--expense)"><i class="fa-solid fa-triangle-exclamation"></i> HUTANG/PIUTANG JATUH TEMPO</h4>
+    ${r.overdue.map(d=>`<div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--border);font-size:12.5px">
+      <span>${esc(d.person)} (${d.type==='hutang'?'Hutang Saya':'Piutang Saya'})</span>
+      <b style="color:var(--expense)">${fmt(debtRemaining(d))}</b>
+    </div>`).join('')}
+    <button class="btn btn-sm" style="margin-top:10px" onclick="nav('debts')">Kelola Hutang & Piutang</button>
+  </div>` : ''}
+  `;
+
+  // Reuse render AI Analysis Pro card (skor/grade/kekuatan/risiko) di dalam Laporan AI ini juga,
+  // supaya SATU sumber kebenaran (tidak ada logika ganda yang bisa beda hasil).
+  const wrap = document.getElementById('ai-full-analysis-wrap');
+  if (wrap) { wrap.id = 'ai-analysis-wrap'; renderAIAnalysis(); }
 }
 
 /* ── DASHBOARD ── */
@@ -1867,6 +2071,12 @@ window.openDebtModal = function(editId) {
     </div>
     <div class="form-group"><label class="form-label">Jatuh Tempo <span style="font-weight:400;color:var(--txm)">(opsional)</span></label><input type="date" class="form-input" id="df-due" value="${d?d.dueDate||'':''}"></div>
     <div class="form-group"><label class="form-label">Catatan <span style="font-weight:400;color:var(--txm)">(opsional)</span></label><input type="text" class="form-input" id="df-note" placeholder="Contoh: Pinjam untuk modal usaha" value="${esc(d?d.note||'':'')}" maxlength="200"></div>
+    <div id="df-kpr-wrap" style="${type==='hutang'?'':'display:none'}">
+      <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--tx2);cursor:pointer;margin-bottom:10px">
+        <input type="checkbox" id="df-iskpr" ${d&&d.isKPR?'checked':''} style="width:16px;height:16px">
+        Ini adalah KPR (Kredit Pemilikan Rumah) <span style="color:var(--txm);font-weight:400">— dipakai utk tangga 6 Kekayaan Abadi</span>
+      </label>
+    </div>
     ${!d ? `
     <div style="padding:12px;border-radius:10px;background:var(--bg2);border:1px solid var(--border);margin-top:6px">
       <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:var(--tx2);cursor:pointer;margin-bottom:0">
@@ -1897,6 +2107,8 @@ window.openDebtModal = function(editId) {
       document.querySelectorAll('#dtog button').forEach(b => b.className = '');
       btn.className = _dType === 'hutang' ? 'sel-expense' : 'sel-income';
       updateAstxnLabel();
+      const kw = document.getElementById('df-kpr-wrap');
+      if (kw) kw.style.display = _dType === 'hutang' ? '' : 'none';
     };
   });
   window._dtypeGetter = () => _dType;
@@ -1908,12 +2120,13 @@ window.saveDebt = async function(editId) {
   const paid   = parseAmount(document.getElementById('df-paid').value) ?? 0;
   const dueDate= document.getElementById('df-due').value || null;
   const note   = document.getElementById('df-note').value.trim();
+  const isKPR  = type === 'hutang' && document.getElementById('df-iskpr').checked;
   if (!person || !amount) { toast('Harap isi nama & jumlah dengan benar','error'); return; }
   if (paid > amount) { toast('Jumlah terbayar tidak boleh melebihi total','error'); return; }
   const btn = document.getElementById('df-save-btn');
   if (btn) { btn.disabled=true; btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i>'; }
   try {
-    const newId = await fbSaveDebt({ type, person, amount, paid, dueDate, note }, editId||null);
+    const newId = await fbSaveDebt({ type, person, amount, paid, dueDate, note, isKPR }, editId||null);
 
     // Kalau ini pencatatan BARU dan user centang "catat penerimaan/pengeluaran dana",
     // buat transaksi arus-kas bertanda flow:'hutang' — supaya saldo akun akurat TAPI
@@ -1930,6 +2143,17 @@ window.saveDebt = async function(editId) {
         note: '', type: isHutang ? 'income' : 'expense', flow: 'hutang', debtId: newId
       });
     }
+
+    // Sinkronkan penanda KPR dgn Pengaturan Tangga Kekayaan Abadi (tangga 6)
+    const wl = S.settings.wealthLadder || {};
+    if (isKPR) {
+      S.settings.wealthLadder = { ...wl, hasKPR:true, kprDebtId:newId };
+      await saveSettings();
+    } else if (wl.kprDebtId === newId) {
+      S.settings.wealthLadder = { ...wl, kprDebtId:null };
+      await saveSettings();
+    }
+
     toast(editId?'Data diperbarui':'Dicatat'); closeModal(); renderPage();
   } catch(e) { toast('Gagal: '+e.message,'error'); if(btn){btn.disabled=false;btn.textContent=editId?'Simpan':'Catat';} }
 };
@@ -2066,22 +2290,140 @@ window.delAcc = function(id) {
   confirmDel('Hapus akun ini?', async () => { try { await fbDelAcc(id); toast('Akun dihapus','info'); renderPage(); } catch(e) { toast('Gagal','error'); } });
 };
 
+/* ── TANGGA KEKAYAAN ABADI: aktivasi/nonaktivasi ── */
+window.openLadderActivationModal = function() {
+  const hutangDebts = S.debts.filter(d => d.type==='hutang');
+  openModal(`
+  <div class="modal-header"><h3><i class="fa-solid fa-crown" style="color:var(--gold);margin-right:6px"></i>Aktifkan Template Kekayaan Abadi</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
+  <div class="modal-body">
+    <p style="font-size:12.5px;color:var(--tx2);margin-bottom:16px">Ini akan menambahkan <b>7 target tangga</b> ke halaman <b>Impian & Tabungan</b>. Progres setiap tangga dihitung otomatis dari data Anda yang sebenarnya (saldo, hutang, transaksi) — bukan yang bisa Anda tandai selesai sendiri.</p>
+    <div class="form-group"><label class="form-label">Target Dana Pendidikan Anak (tangga 5) <span style="font-weight:400;color:var(--txm)">(bisa diubah nanti)</span></label><input type="text" class="form-input" id="wl-edu" placeholder="Contoh: 50.000.000" inputmode="numeric" oninput="liveFormatAmount(this)"></div>
+    <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--tx2);cursor:pointer;margin-bottom:8px">
+      <input type="checkbox" id="wl-haskpr" style="width:16px;height:16px" onchange="document.getElementById('wl-kpr-sel').style.display=this.checked?'':'none'">
+      Saya punya KPR (Kredit Pemilikan Rumah) — tangga 6
+    </label>
+    <div id="wl-kpr-sel" style="display:none;margin-bottom:6px">
+      <select class="form-input" id="wl-kprdebt">
+        <option value="">— Pilih dari Hutang yang sudah dicatat —</option>
+        ${hutangDebts.map(d=>`<option value="${d.id}">${esc(d.person)} (${fmt(d.amount)})</option>`).join('')}
+      </select>
+      <p style="font-size:10.5px;color:var(--txm);margin-top:6px">Belum ada di daftar? Catat dulu di halaman Hutang & Piutang dengan centang "Ini KPR", nanti otomatis tersambung.</p>
+    </div>
+  </div>
+  <div class="modal-footer"><button class="btn" onclick="closeModal()">Batal</button><button class="btn btn-primary" onclick="confirmActivateLadder()">Aktifkan</button></div>`);
+};
+window.confirmActivateLadder = function() {
+  const eduTarget = parseAmount(document.getElementById('wl-edu').value) || 0;
+  const hasKPR = document.getElementById('wl-haskpr').checked;
+  const kprDebtId = hasKPR ? (document.getElementById('wl-kprdebt').value || null) : null;
+  closeModal();
+  confirmAction(
+    'Fitur ini akan melacak progres Anda secara otomatis dan tidak bisa ditandai selesai secara manual. Aktifkan Template Kekayaan Abadi sekarang?',
+    async () => { await activateWealthLadder(eduTarget, hasKPR, kprDebtId); },
+    { icon:'fa-crown', title:'Konfirmasi Aktivasi', okLabel:'Ya, Aktifkan' }
+  );
+};
+async function activateWealthLadder(eduTarget, hasKPR, kprDebtId) {
+  try {
+    for (const m of LADDER_META) {
+      const data = { name:`Tangga ${m.step}: ${m.title}`, icon:m.icon, color:m.color, ladderStep:m.step, autoTrack:true,
+        target: m.step===1?10000000:(m.step===5?eduTarget:0), current:0, deadline:'' };
+      await fbSaveGoal(data, null);
+    }
+    S.settings.wealthLadder = { enabled:true, hasKPR, kprDebtId, activatedAt: today() };
+    await saveSettings();
+    toast('Template Kekayaan Abadi diaktifkan! 🎉','success');
+    nav('goals');
+  } catch(e) { toast('Gagal mengaktifkan: '+e.message,'error'); }
+}
+window.deactivateWealthLadder = function() {
+  confirmDel('Nonaktifkan Template Kekayaan Abadi? Semua 7 target tangga akan dihapus dari Impian & Tabungan (tabungan Dana Darurat/Pendidikan yang sudah terkumpul juga ikut hilang).', async () => {
+    try {
+      const ladderGoals = S.goals.filter(g => g.ladderStep);
+      for (const g of ladderGoals) await fbDelGoal(g.id);
+      S.settings.wealthLadder = { enabled:false, hasKPR:null, kprDebtId:null };
+      await saveSettings();
+      toast('Template dinonaktifkan','info'); renderPage();
+    } catch(e) { toast('Gagal: '+e.message,'error'); }
+  });
+};
+// Tombol "Update" per tangga — HANYA memicu hitung ulang dari data asli + tampilkan
+// penjelasan sumber angkanya. Tidak pernah menandai selesai hanya karena diklik.
+window.recheckLadderStep = function(goalId) {
+  const g = S.goals.find(x=>x.id===goalId); if (!g) return;
+  const p = computeLadderProgress(g);
+  openModal(`
+  <div class="modal-header"><h3>Cek Ulang: ${esc(g.name)}</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
+  <div class="modal-body">
+    <div style="text-align:center;margin-bottom:14px">
+      <div style="font-size:34px;font-weight:900;font-family:'Outfit';color:${p.done?'var(--income)':'var(--gold)'}">${p.pct.toFixed(0)}%</div>
+      <span class="badge" style="background:${p.done?'var(--income-l)':'var(--gold-l)'};color:${p.done?'var(--income)':'var(--gold)'}">${p.done?'✅ Tercapai':'🔄 Berjalan'}</span>
+    </div>
+    <p style="font-size:12.5px;color:var(--tx2);line-height:1.6">${p.detail}</p>
+    <p style="font-size:10.5px;color:var(--txm);margin-top:12px">Angka ini dihitung langsung dari data Anda saat ini (bukan klaim manual) — akan berubah otomatis begitu Anda mencatat transaksi/hutang/tabungan baru.</p>
+    ${p.needsCategory?`<button class="btn btn-primary btn-sm" style="margin-top:10px" onclick="closeModal();quickCreateInvestCategory()">Buat Kategori "Investasi" Sekarang</button>`:''}
+    ${p.needsKpr?`<button class="btn btn-primary btn-sm" style="margin-top:10px" onclick="closeModal();nav('debts')">Ke Halaman Hutang</button>`:''}
+    ${p.needsTarget?`<button class="btn btn-primary btn-sm" style="margin-top:10px" onclick="closeModal();openGoalModal('${g.id}')">Set Target Sekarang</button>`:''}
+  </div>
+  <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal();renderPage()">Tutup</button></div>`);
+};
+window.quickCreateInvestCategory = async function() {
+  try { await ensureCategoryByName('Investasi','expense','fa-chart-line','#22D3EE'); toast('Kategori "Investasi" dibuat. Mulai catat transaksi investasi Anda!'); renderPage(); }
+  catch(e) { toast('Gagal: '+e.message,'error'); }
+};
+
 /* ── GOALS ── */
 function rGoal(el) {
+  const ladderGoals = S.goals.filter(g => g.ladderStep).sort((a,b)=>a.ladderStep-b.ladderStep);
+  const normalGoals = S.goals.filter(g => !g.ladderStep);
+  const ladderOn = !!S.settings.wealthLadder?.enabled;
+
   el.innerHTML = `
+  ${ladderOn && ladderGoals.length ? `
+  <div class="card" style="margin-bottom:22px;position:relative;overflow:hidden">
+    <div style="position:absolute;top:-50px;right:-50px;width:160px;height:160px;border-radius:50%;background:radial-gradient(circle,rgba(255,184,48,0.1) 0%,transparent 70%)"></div>
+    <div style="display:flex;align-items:center;gap:9px;margin-bottom:4px;position:relative">
+      <i class="fa-solid fa-crown" style="color:var(--gold);font-size:17px"></i>
+      <h3 style="font-size:16px;font-weight:800">Tangga Kekayaan Abadi</h3>
+    </div>
+    <p style="font-size:11.5px;color:var(--txm);margin-bottom:18px">Progres dihitung otomatis dari data Anda — klik "Cek" untuk melihat sumber angkanya.</p>
+    <div class="ladder-track">
+      ${ladderGoals.map((g,i) => {
+        const p = computeLadderProgress(g);
+        const statusColor = p.done ? 'var(--income)' : (p.pct>0 ? 'var(--gold)' : 'var(--txm)');
+        return `<div class="ladder-step${p.done?' done':''}">
+          <div class="ladder-step-num" style="background:${p.done?'var(--income)':'var(--bg)'};color:${p.done?'#fff':statusColor};box-shadow:${p.done?'0 0 0 3px var(--income-l)':'var(--neu-raised-sm)'}">${p.done?'<i class="fa-solid fa-check"></i>':g.ladderStep}</div>
+          <div class="ladder-step-body">
+            <div style="display:flex;justify-content:space-between;align-items:start;gap:10px;flex-wrap:wrap">
+              <div>
+                <div style="font-weight:700;font-size:13.5px"><i class="fa-solid ${g.icon}" style="color:${g.color};margin-right:6px"></i>${esc(g.name.replace(/^Tangga \d+: /,''))}</div>
+                <div style="font-size:11px;color:var(--txm);margin-top:2px">${p.pct.toFixed(0)}% · ${fmt(p.actual)} / ${fmt(p.target)}</div>
+              </div>
+              <div style="display:flex;gap:6px;align-items:center;flex-shrink:0">
+                ${[3,5].includes(g.ladderStep)&&!p.done?`<button class="btn btn-sm" style="padding:5px 10px" onclick="addToGoal('${g.id}')"><i class="fa-solid fa-plus"></i></button>`:''}
+                <button class="btn btn-sm" style="padding:5px 10px" onclick="recheckLadderStep('${g.id}')"><i class="fa-solid fa-magnifying-glass"></i> Cek</button>
+              </div>
+            </div>
+            <div class="progress-bar" style="margin-top:8px"><div class="progress-fill" style="width:${p.pct}%;background:${statusColor}"></div></div>
+          </div>
+        </div>`;
+      }).join('')}
+    </div>
+  </div>` : ''}
+
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px">
-    <div><h3 style="font-size:17px;font-weight:700">Target Tabungan</h3><p style="font-size:12.5px;color:var(--tx2);margin-top:3px">Pantau progres tujuan keuangan</p></div>
+    <div><h3 style="font-size:17px;font-weight:700">Impian & Tabungan</h3><p style="font-size:12.5px;color:var(--tx2);margin-top:3px">Pantau progres tujuan keuangan Anda</p></div>
     <button class="btn btn-primary btn-sm" onclick="openGoalModal()"><i class="fa-solid fa-plus"></i> Tambah Target</button>
   </div>
   <div class="grid-auto" id="goal-grid"></div>`;
 
   const grid = document.getElementById('goal-grid');
-  if (!S.goals.length) { grid.innerHTML='<div class="card empty-state" style="grid-column:1/-1"><i class="fa-solid fa-bullseye"></i><p>Belum ada target tabungan. Mulai rencanakan sekarang!</p></div>'; return; }
+  if (!normalGoals.length) { grid.innerHTML='<div class="card empty-state" style="grid-column:1/-1"><i class="fa-solid fa-bullseye"></i><p>Belum ada target tabungan/impian. Mulai rencanakan sekarang!</p></div>'; return; }
 
-  grid.innerHTML = S.goals.map(g => {
-    const pct  = Math.min((g.current/g.target)*100, 100);
+  grid.innerHTML = normalGoals.map(g => {
+    const pct  = g.target>0 ? Math.min((g.current/g.target)*100, 100) : 0;
     const rem  = g.target - g.current;
-    const dl   = Math.max(0, Math.ceil((new Date(g.deadline) - new Date()) / 864e5));
+    const dl   = g.deadline ? Math.max(0, Math.ceil((new Date(g.deadline) - new Date()) / 864e5)) : null;
     const r    = 33, circ = 2*Math.PI*r, off = circ - (pct/100)*circ;
     return `<div class="card">
       <div style="display:flex;justify-content:space-between;align-items:start">
@@ -2093,7 +2435,7 @@ function rGoal(el) {
           <div>
             <div style="font-weight:700;font-size:15px;display:flex;align-items:center;gap:7px"><i class="fa-solid ${g.icon}" style="color:${g.color}"></i> ${esc(g.name)}</div>
             <div style="font-size:12.5px;color:var(--tx2);margin-top:3px">${fmt(g.current)} dari ${fmt(g.target)}</div>
-            <div style="font-size:11px;color:var(--txm);margin-top:2px">Sisa ${fmt(rem)} · ${dl} hari lagi</div>
+            <div style="font-size:11px;color:var(--txm);margin-top:2px">Sisa ${fmt(rem)}${dl!==null?' · '+dl+' hari lagi':''}</div>
           </div>
         </div>
         <div style="display:flex;gap:4px;flex-shrink:0">
@@ -2424,6 +2766,22 @@ function rSet(el) {
         <option value="¥"${S.settings.currency==='¥'?' selected':''}>¥ — Yen</option>
         <option value="£"${S.settings.currency==='£'?' selected':''}>£ — Pound</option>
       </select>
+    </div>
+
+    <div class="card" style="margin-bottom:16px;position:relative;overflow:hidden">
+      <div style="position:absolute;top:-40px;right:-40px;width:130px;height:130px;border-radius:50%;background:radial-gradient(circle,rgba(255,184,48,0.12) 0%,transparent 70%)"></div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;position:relative">
+        <i class="fa-solid fa-crown" style="color:var(--gold);font-size:18px"></i>
+        <h4 style="font-size:15px">Template Kekayaan Abadi</h4>
+        ${S.settings.wealthLadder?.enabled?'<span class="badge" style="background:var(--income-l);color:var(--income);margin-left:auto">Aktif</span>':''}
+      </div>
+      <p style="font-size:12px;color:var(--tx2);margin-bottom:12px">7 tahap tangga kebebasan finansial (Nabung Cash → Bebas Hutang → Dana Darurat → Investasi 20% → Dana Pendidikan → Lunasi KPR → Kekayaan Abadi & Berbagi). Progresnya <b>otomatis dihitung dari data transaksi, hutang, dan tabungan Anda yang sebenarnya</b> — tidak bisa ditandai selesai secara manual.</p>
+      ${S.settings.wealthLadder?.enabled ? `
+        <button class="btn btn-sm" onclick="nav('goals')" style="margin-right:8px"><i class="fa-solid fa-stairs"></i> Lihat Progres</button>
+        <button class="btn btn-sm btn-danger" onclick="deactivateWealthLadder()"><i class="fa-solid fa-power-off"></i> Nonaktifkan</button>
+      ` : `
+        <button class="btn btn-primary btn-sm" onclick="openLadderActivationModal()"><i class="fa-solid fa-crown"></i> Aktifkan Template</button>
+      `}
     </div>
 
     <div class="card" style="margin-bottom:16px">
