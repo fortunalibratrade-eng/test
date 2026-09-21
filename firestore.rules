@@ -26,7 +26,8 @@ service cloud.firestore {
     function isValidBudget(d) {
       return d.keys().hasAll(['categoryId','amount'])
         && d.categoryId is string && d.categoryId.size() > 0
-        && d.amount is number && d.amount > 0 && d.amount < 999999999999;
+        && d.amount is number && d.amount > 0 && d.amount < 999999999999
+        && (!('period' in d) || d.period in ['harian','mingguan','bulanan','tahunan']);
     }
 
     // ── Validasi skema TARGET TABUNGAN / IMPIAN (termasuk Tangga Kekayaan Abadi) ──
@@ -77,13 +78,18 @@ service cloud.firestore {
     // Catatan: toggle checklist mengirim update parsial {completedPeriods},
     // jadi sama seperti debt, validasi bersifat per-field (bukan hasAll penuh).
     function isValidTarget(d) {
-      return (!('period' in d) || d.period in ['harian','bulanan','tahunan'])
-        && (!('mode' in d)     || d.mode in ['nominal','checklist'])
+      return (!('period' in d) || d.period in ['harian','mingguan','bulanan','tahunan'])
+        && (!('mode' in d)     || d.mode in ['nominal','checklist','jadwal'])
         && (!('title' in d)    || (d.title is string && d.title.size() > 0 && d.title.size() <= 60))
         && (!('description' in d) || (d.description is string && d.description.size() <= 150))
         && (!('goalType' in d) || d.goalType in ['hemat','batas'])
+        && (!('basis' in d)    || d.basis in ['total','kategori'])
+        && (!('incomeCatId' in d)  || d.incomeCatId is string)
+        && (!('expenseCatId' in d) || d.expenseCatId is string)
         && (!('amount' in d)   || (d.amount is number && d.amount > 0 && d.amount < 999999999999))
-        && (!('completedPeriods' in d) || d.completedPeriods is list);
+        && (!('completedPeriods' in d) || d.completedPeriods is list)
+        && (!('schedules' in d)        || d.schedules is map)
+        && (!('completedBlocks' in d)  || d.completedBlocks is map);
     }
 
     match /users/{userId} {

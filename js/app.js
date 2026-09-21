@@ -154,7 +154,7 @@ let S = {
 let txnFilter  = { type: 'all', search: '', month: '' };
 let reportRange = 3;
 let debtFilter = 'all'; // all | hutang | piutang
-let _targetTab = 'harian'; // harian | bulanan | tahunan
+let _targetTab = 'harian'; // harian | mingguan | bulanan | tahunan
 let _txnType   = 'expense';
 let _charts    = {};
 let _unsubscribers = [];
@@ -214,6 +214,38 @@ function dayTxns(dateStr) {
 function yearTxns(ago = 0) {
   const y = new Date().getFullYear() - ago;
   return S.transactions.filter(t => t.date.startsWith(String(y)));
+}
+
+/* ═══════════════════════════════════════════
+   HELPER PERIODE EKSPLISIT — dipakai Anggaran & Target Berkala
+   supaya harian/mingguan/bulanan/tahunan semua bisa saling connect.
+═══════════════════════════════════════════ */
+function txnsOnDate(dateStr) { return S.transactions.filter(t => t.date === dateStr); }
+// Senin sbg awal minggu. Input tanggal apapun, hasil = tanggal Senin di minggu yg sama.
+function weekStartOf(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  const day = d.getDay(); // 0=Min..6=Sab
+  d.setDate(d.getDate() + (day === 0 ? -6 : 1 - day));
+  return localDateStr(d);
+}
+function txnsInWeek(weekStartStr) {
+  const start = new Date(weekStartStr + 'T00:00:00');
+  const end = new Date(start); end.setDate(end.getDate() + 6);
+  return S.transactions.filter(t => { const d = new Date(t.date+'T00:00:00'); return d >= start && d <= end; });
+}
+function txnsInMonth(y, m) { // m: 1-12
+  const mm = String(m).padStart(2,'0');
+  return S.transactions.filter(t => t.date.startsWith(`${y}-${mm}`));
+}
+function txnsInYear(y) { return S.transactions.filter(t => t.date.startsWith(String(y))); }
+
+const PERIOD_DAYS = { harian:1, mingguan:7, bulanan:30, tahunan:365 };
+const PERIOD_LABEL = { harian:'Harian', mingguan:'Mingguan', bulanan:'Bulanan', tahunan:'Tahunan' };
+// Konversi kasar nominal antar periode (mis. hemat 50rb/hari ≈ berapa/bulan, berapa/tahun)
+function convertPeriodAmount(amount, fromPeriod, toPeriod) {
+  if (fromPeriod === toPeriod) return amount;
+  const dailyRate = amount / PERIOD_DAYS[fromPeriod];
+  return dailyRate * PERIOD_DAYS[toPeriod];
 }
 function sumType(arr, type) { return arr.filter(t=>t.type===type).reduce((s,t)=>s+t.amount,0); }
 function totalBal() { return S.transactions.reduce((s,t)=>s+(t.type==='income'?t.amount:-t.amount), 0); }
@@ -338,21 +370,93 @@ function computeLadderProgress(g) {
 // ── Target Berkala: kunci periode berjalan (dipakai utk cek "sudah selesai periode ini?") ──
 function currentPeriodKey(period) {
   const n = new Date();
-  if (period === 'harian')  return today();
-  if (period === 'bulanan') return `${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,'0')}`;
+  if (period === 'harian')   return today();
+  if (period === 'mingguan') return weekStartOf(today());
+  if (period === 'bulanan')  return `${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,'0')}`;
   return String(n.getFullYear()); // tahunan
+}
+function periodTxnsFor(period) {
+  if (period === 'harian')   return dayTxns(today());
+  if (period === 'mingguan') return txnsInWeek(weekStartOf(today()));
+  if (period === 'bulanan')  return monthTxns(0);
+  return yearTxns(0);
 }
 // Hitung progres nominal target dari data transaksi ASLI (bukan input manual) — inilah "sinkronnya"
 function targetProgress(t) {
   if (t.mode !== 'nominal') return null;
-  let arr;
-  if (t.period === 'harian')  arr = dayTxns(today());
-  else if (t.period === 'bulanan') arr = monthTxns(0);
-  else arr = yearTxns(0);
-  arr = filterReal(arr);
+  const arr = filterReal(periodTxnsFor(t.period));
+  if (t.basis === 'kategori' && t.incomeCatId) {
+    // mis. "Invest 20% dari income Ngojol" — persentase dihitung dari kategori SPESIFIK, bukan total
+    const incomeAmt = arr.filter(x=>x.type==='income' && x.categoryId===t.incomeCatId).reduce((s,x)=>s+x.amount,0);
+    const spentAmt  = t.expenseCatId ? arr.filter(x=>x.type==='expense' && x.categoryId===t.expenseCatId).reduce((s,x)=>s+x.amount,0) : 0;
+    const ratio = incomeAmt>0 ? (spentAmt/incomeAmt*100) : 0;
+    return { actual: Math.round(ratio*10)/10, target: t.amount, pct: t.amount>0?Math.min(ratio/t.amount*100,100):0, isPercent:true, incomeAmt, spentAmt };
+  }
   const inc = sumType(arr,'income'), exp = sumType(arr,'expense');
   const actual = t.goalType === 'hemat' ? (inc - exp) : exp; // 'hemat'=net saving, 'batas'=total pengeluaran
   return { actual, target: t.amount, pct: t.amount>0 ? Math.min(Math.max(actual/t.amount,0)*100,100) : 0 };
+}
+
+// ── Target Berkala mode 'jadwal': jadwal harian ala rencana pribadi, beda hari kerja/Sabtu/Minggu ──
+function todayVariantKey() {
+  const day = new Date().getDay(); // 0=Min..6=Sab
+  if (day === 6) return 'saturday';
+  if (day === 0) return 'sunday';
+  return 'weekday';
+}
+function scheduleBlocksFor(t, variantKey) { return (t.schedules && t.schedules[variantKey]) || []; }
+// Parse teks bebas format "05:00-07:00 Mandi, sholat, makan" (satu baris = satu blok waktu)
+function parseScheduleText(text) {
+  return String(text||'').split('\n').map(line=>line.trim()).filter(Boolean).map(line => {
+    const m = line.match(/^(\d{1,2})[:.\-](\d{2})\s*[-–]\s*(\d{1,2})[:.\-](\d{2})\s*(.*)$/);
+    if (!m) return null;
+    const start = `${m[1].padStart(2,'0')}:${m[2]}`, end = `${m[3].padStart(2,'0')}:${m[4]}`;
+    return { start, end, activity: m[5].trim() || '(tanpa judul)' };
+  }).filter(Boolean);
+}
+function scheduleToText(blocks) { return (blocks||[]).map(b=>`${b.start}-${b.end} ${b.activity}`).join('\n'); }
+
+// ── Rekap berjenjang: mingguan → bulanan, bulanan → tahunan (sesuai request "rekap evaluasi") ──
+function weeksInMonth(y, m) {
+  const weeks = new Set();
+  const first = new Date(y, m-1, 1), last = new Date(y, m, 0);
+  for (let d = new Date(first); d <= last; d.setDate(d.getDate()+1)) weeks.add(weekStartOf(localDateStr(d)));
+  return [...weeks];
+}
+function periodTxnsForKey(period, key) {
+  if (period === 'harian')   return dayTxns(key);
+  if (period === 'mingguan') return txnsInWeek(key);
+  if (period === 'bulanan')  { const [y,m] = key.split('-').map(Number); return txnsInMonth(y,m); }
+  return txnsInYear(Number(key));
+}
+// Dihitung ULANG langsung dari transaksi riil periode tsb (bukan snapshot) — supaya rekap akurat walau lintas waktu.
+function targetAchievedForPeriodKey(t, pKey) {
+  if (t.mode === 'checklist') return (t.completedPeriods||[]).includes(pKey);
+  if (t.mode !== 'nominal') return false;
+  const arr = filterReal(periodTxnsForKey(t.period, pKey));
+  if (t.basis === 'kategori' && t.incomeCatId) {
+    const incomeAmt = arr.filter(x=>x.type==='income' && x.categoryId===t.incomeCatId).reduce((s,x)=>s+x.amount,0);
+    const spentAmt  = t.expenseCatId ? arr.filter(x=>x.type==='expense' && x.categoryId===t.expenseCatId).reduce((s,x)=>s+x.amount,0) : 0;
+    return incomeAmt>0 && (spentAmt/incomeAmt*100) >= t.amount;
+  }
+  const inc = sumType(arr,'income'), exp = sumType(arr,'expense');
+  const actual = t.goalType === 'hemat' ? (inc - exp) : exp;
+  return t.goalType === 'hemat' ? actual >= t.amount : actual <= t.amount;
+}
+function rekapMingguanUntukBulan(y, m) {
+  const weekly = S.targets.filter(t => t.period === 'mingguan');
+  if (!weekly.length) return null;
+  const weeks = weeksInMonth(y, m);
+  let done = 0, total = 0;
+  weekly.forEach(t => weeks.forEach(wk => { total++; if (targetAchievedForPeriodKey(t, wk)) done++; }));
+  return { done, total };
+}
+function rekapBulananUntukTahun(y) {
+  const monthly = S.targets.filter(t => t.period === 'bulanan');
+  if (!monthly.length) return null;
+  let done = 0, total = 0;
+  for (let m=1; m<=12; m++) { const mk = `${y}-${String(m).padStart(2,'0')}`; monthly.forEach(t => { total++; if (targetAchievedForPeriodKey(t, mk)) done++; }); }
+  return { done, total };
 }
 
 function setSyncDot(state) {
@@ -862,32 +966,36 @@ async function fbDelTarget(id) {
 /* ─────────────────────────────────────────
    BUDGET ALERTS
 ───────────────────────────────────────── */
+// Anggaran punya SATU periode "native" (harian/mingguan/bulanan/tahunan) — periode lain
+// hanya dikonversi (perkiraan) dari sini, supaya semuanya connect ke satu sumber.
+function budgetPeriod(b) { return b.period || 'bulanan'; }
+function budgetNativeSpent(b) {
+  const period = budgetPeriod(b);
+  let arr;
+  if (period === 'harian') arr = txnsOnDate(today());
+  else if (period === 'mingguan') arr = txnsInWeek(weekStartOf(today()));
+  else if (period === 'tahunan') arr = txnsInYear(new Date().getFullYear());
+  else arr = monthTxns(0);
+  return filterReal(arr).filter(t=>t.categoryId===b.categoryId && t.type==='expense').reduce((s,t)=>s+t.amount,0);
+}
 function checkBudgetAlerts() {
-  const tm = filterReal(monthTxns(0)).filter(t => t.type === 'expense');
-  const overBudget = S.budgets.filter(b => {
-    const spent = tm.filter(t => t.categoryId === b.categoryId).reduce((s,t) => s+t.amount, 0);
-    return spent > b.amount;
-  });
+  const overBudget = S.budgets.filter(b => budgetNativeSpent(b) > b.amount);
   const dot = document.getElementById('notif-dot');
   if (dot) dot.classList.toggle('hidden', overBudget.length === 0);
 }
 
 document.getElementById('notif-btn').addEventListener('click', () => {
-  const tm = filterReal(monthTxns(0)).filter(t => t.type === 'expense');
-  const over = S.budgets.filter(b => {
-    const spent = tm.filter(t => t.categoryId === b.categoryId).reduce((s,t) => s+t.amount, 0);
-    return spent > b.amount;
-  });
+  const over = S.budgets.filter(b => budgetNativeSpent(b) > b.amount);
   if (!over.length) { toast('Semua anggaran masih aman', 'info'); return; }
   openModal(`
     <div class="modal-header"><h3><i class="fa-solid fa-bell" style="color:var(--expense);margin-right:8px"></i>Peringatan Anggaran</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
     <div class="modal-body">
       ${over.map(b => {
         const c = catObj(b.categoryId);
-        const spent = tm.filter(t => t.categoryId === b.categoryId).reduce((s,t) => s+t.amount, 0);
+        const spent = budgetNativeSpent(b);
         return `<div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border)">
           <div style="width:38px;height:38px;border-radius:10px;background:${c.color}18;color:${c.color};display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0"><i class="fa-solid ${c.icon}"></i></div>
-          <div style="flex:1"><div style="font-weight:600;font-size:13px">${esc(c.name)}</div>
+          <div style="flex:1"><div style="font-weight:600;font-size:13px">${esc(c.name)} <span style="font-weight:400;color:var(--txm);font-size:10.5px">(${PERIOD_LABEL[budgetPeriod(b)]})</span></div>
           <div style="font-size:11.5px;color:var(--expense)">Terpakai ${fmt(spent)} dari anggaran ${fmt(b.amount)}</div></div>
           <span class="badge" style="background:var(--expense-l);color:var(--expense)">+${fmt(spent-b.amount)} over</span>
         </div>`;
@@ -914,7 +1022,7 @@ const NAV = [
 ];
 
 function renderNav() {
-  const tm = monthTxns(0).filter(t => t.type === 'expense');
+  const tm = filterReal(monthTxns(0)).filter(t => t.type === 'expense');
   const overCount = S.budgets.filter(b => {
     const spent = tm.filter(t => t.categoryId === b.categoryId).reduce((s,t) => s+t.amount, 0);
     return spent > b.amount;
@@ -1064,6 +1172,12 @@ function computeAIAnalysis() {
   const emergencyTarget = histAvg * 3;
   const emergencyCoverage = emergencyTarget > 0 ? Math.min(totalGoalSaved/emergencyTarget,1) : (totalGoalSaved>0?1:0.5);
 
+  // ── Kesadaran Hutang/Piutang (supaya SATU mesin AI ini konsisten dipakai
+  //    di Dashboard maupun Laporan AI — tidak ada logika ganda) ──
+  const hutang = totalHutang(), piutang = totalPiutang();
+  const overdueDebts = S.debts.filter(d => d.dueDate && d.dueDate < today() && debtRemaining(d) > 0);
+  const debtToIncomeRatio = inc > 0 ? hutang/inc : (hutang>0 ? 2 : 0);
+
   const now = new Date();
   const daysInMonth = new Date(now.getFullYear(), now.getMonth()+1, 0).getDate();
   const daysElapsed = now.getDate();
@@ -1076,7 +1190,11 @@ function computeAIAnalysis() {
   score += (S.budgets.length ? budgetScorePct/100 : 0.7) * 30;
   score += Math.max(0, 1 - Math.min(volatilityRatio,1)) * 20;
   score += emergencyCoverage * 15;
-  score = Math.round(Math.max(0, Math.min(100, score)));
+  // Penalti hutang: keterlambatan bayar & beban hutang tinggi menurunkan skor kesehatan finansial riil
+  let debtPenalty = 0;
+  if (overdueDebts.length) debtPenalty += Math.min(overdueDebts.length * 8, 20);
+  if (debtToIncomeRatio > 3) debtPenalty += 10; else if (debtToIncomeRatio > 1.5) debtPenalty += 5;
+  score = Math.round(Math.max(0, Math.min(100, score - debtPenalty)));
 
   let grade, gradeColor;
   if (score>=90){grade='A+';gradeColor='var(--income)';}
@@ -1087,6 +1205,19 @@ function computeAIAnalysis() {
   else {grade='E';gradeColor='var(--expense)';}
 
   const strengths = [], risks = [], tips = [];
+
+  // Hutang/piutang — prioritas paling depan karena paling mendesak & paling nyata risikonya
+  if (overdueDebts.length) {
+    risks.unshift(`${overdueDebts.length} hutang/piutang sudah lewat jatuh tempo, total ${fmt(overdueDebts.reduce((s,d)=>s+debtRemaining(d),0))}. Ini aktif menurunkan skor kesehatan finansial Anda.`);
+  }
+  if (hutang > 0 && debtToIncomeRatio > 1.5) {
+    risks.unshift(`Sisa hutang (${fmt(hutang)}) cukup besar dibanding pendapatan bulan ini (${fmt(inc)}). Prioritaskan pelunasan sebelum menambah komitmen baru.`);
+  } else if (S.debts.some(d=>d.type==='hutang') && hutang === 0) {
+    strengths.push('Semua hutang Anda sudah lunas — bebas kewajiban.');
+  }
+  if (piutang > 0) {
+    tips.push(`Anda memiliki piutang ${fmt(piutang)} yang belum tertagih. Tagih segera agar bisa dialokasikan ke tabungan/investasi.`);
+  }
 
   if (savingsRate >= 0.2) strengths.push(`Tingkat tabungan sehat: ${(savingsRate*100).toFixed(1)}% dari pemasukan bulan ini berhasil disisihkan.`);
   else if (savingsRate < 0) risks.push(`Pengeluaran melebihi pemasukan bulan ini sebesar ${fmt(Math.abs(inc-exp))}. Arus kas negatif perlu segera dikoreksi.`);
@@ -1127,6 +1258,7 @@ function computeAIAnalysis() {
   return {
     score, grade, gradeColor, summary,
     savingsRate, inc, exp, projectedExp, totalBudget,
+    hutang, piutang, overdueDebts, debtToIncomeRatio,
     strengths: strengths.slice(0,4), risks: risks.slice(0,4), tips: tips.slice(0,3)
   };
 }
@@ -1189,9 +1321,9 @@ function computeFullAIReport() {
   })();
   const nwChange = netWorth() - lastMonthNW;
 
-  // ── Hutang/Piutang ──
-  const hutang = totalHutang(), piutang = totalPiutang();
-  const overdue = S.debts.filter(d => d.dueDate && d.dueDate < today() && debtRemaining(d) > 0);
+  // ── Hutang/Piutang (pakai hasil dari mesin AI inti — satu sumber kebenaran) ──
+  const hutang = base.hutang, piutang = base.piutang;
+  const overdue = base.overdueDebts;
 
   // ── Tangga Kekayaan Abadi ──
   const ladderGoals = S.goals.filter(g=>g.ladderStep).sort((a,b)=>a.ladderStep-b.ladderStep);
@@ -1870,10 +2002,9 @@ window.saveTransfer = async function() {
 
 /* ── BUDGETS ── */
 function rBud(el) {
-  const tm = monthTxns(0).filter(t => t.type === 'expense');
   el.innerHTML = `
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;flex-wrap:wrap;gap:10px">
-    <div><h3 style="font-size:17px;font-weight:700">Anggaran Bulan Ini</h3><p style="font-size:12.5px;color:var(--tx2);margin-top:3px">Kelola batas pengeluaran per kategori</p></div>
+    <div><h3 style="font-size:17px;font-weight:700">Anggaran</h3><p style="font-size:12.5px;color:var(--tx2);margin-top:3px">Harian, mingguan, bulanan, tahunan — semua saling terhubung dari satu angka</p></div>
     <button class="btn btn-primary btn-sm" onclick="openBudModal()"><i class="fa-solid fa-plus"></i> Tambah Anggaran</button>
   </div>
   <div class="grid-auto" id="bud-grid"></div>`;
@@ -1884,20 +2015,23 @@ function rBud(el) {
   }
   grid.innerHTML = S.budgets.map(b => {
     const c = catObj(b.categoryId);
-    const spent = tm.filter(t => t.categoryId === b.categoryId).reduce((s,t) => s+t.amount, 0);
+    const period = budgetPeriod(b);
+    const spent = budgetNativeSpent(b);
     const pct   = Math.min((spent/b.amount)*100, 100);
     const over  = spent > b.amount;
     const bc    = over ? 'var(--expense)' : pct>75 ? 'var(--gold)' : c.color;
+    const others = ['harian','mingguan','bulanan','tahunan'].filter(p=>p!==period);
     return `<div class="card${over?' pulse-red':''}">
       <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:12px">
         <div style="display:flex;align-items:center;gap:10px">
           <div style="width:38px;height:38px;border-radius:10px;background:${c.color}18;color:${c.color};display:flex;align-items:center;justify-content:center;box-shadow:var(--neu-pressed-sm)"><i class="fa-solid ${c.icon}"></i></div>
           <div>
-            <div style="font-weight:600;font-size:13.5px">${esc(c.name)}</div>
+            <div style="font-weight:600;font-size:13.5px">${esc(c.name)} <span class="badge" style="background:var(--acc-l);color:var(--acc);font-size:9px;margin-left:2px">${PERIOD_LABEL[period]}</span></div>
             <div style="font-size:11px;color:${over?'var(--expense)':pct>75?'var(--gold)':'var(--txm)'}">${over?'⚠ Melebihi anggaran!':pct>75?'Hati-hati, hampir batas':'Aman'}</div>
           </div>
         </div>
         <div style="display:flex;gap:4px">
+          <button class="btn-icon" style="width:27px;height:27px" onclick="openBudgetDetailModal('${b.id}')" title="Lihat detail per periode"><i class="fa-solid fa-magnifying-glass" style="font-size:9px"></i></button>
           <button class="btn-icon" style="width:27px;height:27px" onclick="openBudModal('${b.id}')"><i class="fa-solid fa-pen" style="font-size:9px"></i></button>
           <button class="btn-icon" style="width:27px;height:27px;color:var(--expense)" onclick="delBud('${b.id}')"><i class="fa-solid fa-trash" style="font-size:9px"></i></button>
         </div>
@@ -1908,35 +2042,193 @@ function rBud(el) {
         <span style="color:var(--txm)">${fmt(b.amount)}</span>
       </div>
       <div style="text-align:right;font-size:11.5px;margin-top:3px;color:${over?'var(--expense)':'var(--income)'};font-weight:600">${over?'+'+fmt(spent-b.amount)+' over':'Sisa: '+fmt(b.amount-spent)}</div>
+      <div style="margin-top:10px;padding-top:9px;border-top:1px solid var(--border);font-size:10.5px;color:var(--txm);display:flex;gap:10px;flex-wrap:wrap">
+        ${others.map(p=>`<span>≈ ${fmt(convertPeriodAmount(b.amount,period,p))}<span style="opacity:.7">/${PERIOD_LABEL[p].toLowerCase()}</span></span>`).join('')}
+      </div>
     </div>`;
   }).join('');
 }
 
+const BUD_PERIODS = ['harian','mingguan','bulanan','tahunan'];
 window.openBudModal = function(editId) {
   const b = editId ? S.budgets.find(x=>x.id===editId) : null;
   const existing = S.budgets.filter(x=>x.id!==editId).map(x=>x.categoryId);
   const avail = S.categories.filter(c=>c.type==='expense'&&!existing.includes(c.id));
   if (!avail.length && !b) { toast('Semua kategori sudah memiliki anggaran','info'); return; }
   const opts = b ? S.categories.filter(c=>c.type==='expense') : avail;
+  const period = b ? budgetPeriod(b) : 'bulanan';
   openModal(`
   <div class="modal-header"><h3>${b?'Edit':'Tambah'} Anggaran</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
   <div class="modal-body">
     <div class="form-group"><label class="form-label">Kategori</label><select class="form-input" id="bf-cat">${opts.map(c=>`<option value="${c.id}"${b&&b.categoryId===c.id?' selected':''}>${esc(c.name)}</option>`).join('')}</select></div>
-    <div class="form-group"><label class="form-label">Jumlah Anggaran per Bulan</label><input type="text" class="form-input" id="bf-amt" placeholder="0" inputmode="numeric" value="${b?groupInt(b.amount):''}" oninput="liveFormatAmount(this)"></div>
+    <div class="form-group"><label class="form-label">Periode</label>
+      <select class="form-input" id="bf-period">${BUD_PERIODS.map(p=>`<option value="${p}"${period===p?' selected':''}>${PERIOD_LABEL[p]}</option>`).join('')}</select>
+    </div>
+    <div class="form-group"><label class="form-label">Jumlah Anggaran</label><input type="text" class="form-input" id="bf-amt" placeholder="0" inputmode="numeric" value="${b?groupInt(b.amount):''}" oninput="liveFormatAmount(this)"></div>
+    <p style="font-size:10.5px;color:var(--txm)">Angka lain (harian/mingguan/bulanan/tahunan) otomatis dikonversi dari sini — tidak perlu diisi manual satu-satu.</p>
   </div>
   <div class="modal-footer"><button class="btn" onclick="closeModal()">Batal</button><button class="btn btn-primary" id="bf-save-btn" onclick="saveBud('${editId||''}')">${b?'Simpan':'Tambah'}</button></div>`);
 };
 window.saveBud = async function(editId) {
   const categoryId = document.getElementById('bf-cat').value;
+  const period = document.getElementById('bf-period').value;
   const amount = parseAmount(document.getElementById('bf-amt').value);
   if (!categoryId||!amount) { toast('Harap isi dengan benar','error'); return; }
   const btn = document.getElementById('bf-save-btn');
   if (btn) { btn.disabled=true; btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i>'; }
-  try { await fbSaveBud({categoryId,amount}, editId||null); toast(editId?'Anggaran diperbarui':'Anggaran ditambahkan'); closeModal(); renderPage(); checkBudgetAlerts(); }
+  try { await fbSaveBud({categoryId,amount,period}, editId||null); toast(editId?'Anggaran diperbarui':'Anggaran ditambahkan'); closeModal(); renderPage(); checkBudgetAlerts(); }
   catch(e) { toast('Gagal: '+e.message,'error'); if(btn){btn.disabled=false;btn.textContent=editId?'Simpan':'Tambah';} }
 };
 window.delBud = function(id) {
   confirmDel('Hapus anggaran ini?', async () => { await fbDelBud(id); toast('Anggaran dihapus','info'); renderPage(); checkBudgetAlerts(); });
+};
+
+/* ── DRILL-DOWN ANGGARAN: Harian / Mingguan / Bulanan / Tahunan yang saling connect ──
+   Klik sel bulan/minggu/hari manapun → pilih mau lihat di Transaksi atau Kalender. */
+let _budDetailTab = 'bulanan';
+let _budDetailYear = new Date().getFullYear();
+window.openBudgetDetailModal = function(budgetId) {
+  _budDetailTab = budgetPeriod(S.budgets.find(x=>x.id===budgetId)) || 'bulanan';
+  _budDetailYear = new Date().getFullYear();
+  renderBudgetDetail(budgetId);
+};
+function renderBudgetDetail(budgetId) {
+  const b = S.budgets.find(x=>x.id===budgetId); if (!b) return;
+  const c = catObj(b.categoryId);
+  openModal(`
+  <div class="modal-header"><h3><i class="fa-solid ${c.icon}" style="color:${c.color};margin-right:6px"></i>${esc(c.name)}</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
+  <div class="modal-body">
+    <div class="type-toggle" id="budd-tabs" style="margin-bottom:16px">
+      ${BUD_PERIODS.map(p=>`<button class="${_budDetailTab===p?'sel-active':''}" data-p="${p}">${PERIOD_LABEL[p]}</button>`).join('')}
+    </div>
+    <div id="budd-body"></div>
+  </div>
+  <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal()">Tutup</button></div>`);
+  document.querySelectorAll('#budd-tabs button').forEach(btn => {
+    btn.onclick = () => { _budDetailTab = btn.dataset.p; renderBudgetDetail(budgetId); };
+  });
+  fillBudgetDetailBody(b);
+}
+function fillBudgetDetailBody(b) {
+  const body = document.getElementById('budd-body'); if (!body) return;
+  const target = convertPeriodAmount(b.amount, budgetPeriod(b), _budDetailTab);
+
+  if (_budDetailTab === 'tahunan') {
+    const years = [_budDetailYear-1, _budDetailYear, _budDetailYear+1];
+    body.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:14px">
+        <button class="btn-icon" onclick="_budDetailYear--;fillBudgetDetailBody(S.budgets.find(x=>x.id==='${b.id}'))"><i class="fa-solid fa-chevron-left"></i></button>
+        <b style="font-family:'Outfit';font-size:16px">${_budDetailYear}</b>
+        <button class="btn-icon" onclick="_budDetailYear++;fillBudgetDetailBody(S.budgets.find(x=>x.id==='${b.id}'))"><i class="fa-solid fa-chevron-right"></i></button>
+      </div>
+      ${years.filter(y=>y===_budDetailYear).map(y => {
+        const spent = filterReal(txnsInYear(y)).filter(t=>t.categoryId===b.categoryId&&t.type==='expense').reduce((s,t)=>s+t.amount,0);
+        const over = spent > target;
+        return `<div class="card" style="cursor:pointer" onclick="openPeriodChoice('${b.categoryId}','tahunan',{y:${y}})">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div><div style="font-weight:700">Tahun ${y}</div><div style="font-size:11px;color:var(--txm)">Target ≈ ${fmt(target)}</div></div>
+            <div style="text-align:right"><div style="font-weight:800;color:${over?'var(--expense)':'var(--income)'}">${fmt(spent)}</div>${over?`<span class="badge" style="background:var(--expense-l);color:var(--expense)">Over</span>`:`<span class="badge" style="background:var(--income-l);color:var(--income)">Aman</span>`}</div>
+          </div>
+        </div>`;
+      }).join('')}
+      <p style="font-size:10.5px;color:var(--txm);margin-top:10px;text-align:center">Klik kartu tahun untuk lihat rincian transaksinya.</p>`;
+    return;
+  }
+
+  if (_budDetailTab === 'bulanan') {
+    body.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:14px">
+        <button class="btn-icon" onclick="_budDetailYear--;fillBudgetDetailBody(S.budgets.find(x=>x.id==='${b.id}'))"><i class="fa-solid fa-chevron-left"></i></button>
+        <b style="font-family:'Outfit';font-size:16px">${_budDetailYear}</b>
+        <button class="btn-icon" onclick="_budDetailYear++;fillBudgetDetailBody(S.budgets.find(x=>x.id==='${b.id}'))"><i class="fa-solid fa-chevron-right"></i></button>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+        ${MO_FULL.map((mLabel,i) => {
+          const spent = filterReal(txnsInMonth(_budDetailYear, i+1)).filter(t=>t.categoryId===b.categoryId&&t.type==='expense').reduce((s,t)=>s+t.amount,0);
+          const hasData = spent > 0;
+          const over = spent > target;
+          const bg = !hasData ? 'var(--bg2)' : over ? 'var(--expense-l)' : 'var(--income-l)';
+          const clr = !hasData ? 'var(--txm)' : over ? 'var(--expense)' : 'var(--income)';
+          return `<div style="padding:10px 6px;border-radius:10px;background:${bg};text-align:center;cursor:pointer;border:1px solid var(--border)" onclick="openPeriodChoice('${b.categoryId}','bulanan',{y:${_budDetailYear},m:${i+1}})">
+            <div style="font-size:11px;font-weight:700;color:${clr}">${MO[i]}</div>
+            <div style="font-size:10px;color:${clr};margin-top:2px">${hasData?fmtS(spent):'—'}</div>
+            ${hasData?`<div style="font-size:8.5px;margin-top:2px">${over?'⚠ over':'✓'}</div>`:''}
+          </div>`;
+        }).join('')}
+      </div>
+      <p style="font-size:10.5px;color:var(--txm);margin-top:10px;text-align:center">Target per bulan ≈ ${fmt(target)} · Klik bulan untuk lihat rincian.</p>`;
+    return;
+  }
+
+  if (_budDetailTab === 'mingguan') {
+    // 8 minggu terakhir (termasuk minggu berjalan)
+    const weeks = [];
+    let ws = weekStartOf(today());
+    for (let i=0;i<8;i++){ weeks.unshift(ws); const d=new Date(ws+'T00:00:00'); d.setDate(d.getDate()-7); ws=localDateStr(d); }
+    body.innerHTML = weeks.map(w => {
+      const end = new Date(w+'T00:00:00'); end.setDate(end.getDate()+6);
+      const spent = filterReal(txnsInWeek(w)).filter(t=>t.categoryId===b.categoryId&&t.type==='expense').reduce((s,t)=>s+t.amount,0);
+      const over = spent > target;
+      const isThisWeek = w === weekStartOf(today());
+      return `<div class="card" style="cursor:pointer;margin-bottom:8px;${isThisWeek?'border-color:var(--acc)':''}" onclick="openPeriodChoice('${b.categoryId}','mingguan',{start:'${w}'})">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div><div style="font-weight:600;font-size:12.5px">${new Date(w+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short'})} – ${end.toLocaleDateString('id-ID',{day:'numeric',month:'short'})}${isThisWeek?' <span style=\"color:var(--acc)\">(minggu ini)</span>':''}</div><div style="font-size:10.5px;color:var(--txm)">Target ≈ ${fmt(target)}</div></div>
+          <div style="font-weight:800;color:${over?'var(--expense)':'var(--income)'}">${fmt(spent)}</div>
+        </div>
+      </div>`;
+    }).join('');
+    return;
+  }
+
+  // harian — 14 hari terakhir
+  const days = []; for (let i=13;i>=0;i--){ const d=new Date(); d.setDate(d.getDate()-i); days.push(localDateStr(d)); }
+  body.innerHTML = `<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px">
+    ${days.map(dateStr => {
+      const spent = filterReal(txnsOnDate(dateStr)).filter(t=>t.categoryId===b.categoryId&&t.type==='expense').reduce((s,t)=>s+t.amount,0);
+      const hasData = spent > 0;
+      const over = spent > target;
+      const isToday = dateStr === today();
+      const bg = !hasData ? 'var(--bg2)' : over ? 'var(--expense-l)' : 'var(--income-l)';
+      const clr = !hasData ? 'var(--txm)' : over ? 'var(--expense)' : 'var(--income)';
+      return `<div style="padding:8px 4px;border-radius:8px;background:${bg};text-align:center;cursor:pointer;border:1px solid ${isToday?'var(--acc)':'var(--border)'}" onclick="openPeriodChoice('${b.categoryId}','harian',{date:'${dateStr}'})">
+        <div style="font-size:9.5px;color:var(--txm)">${new Date(dateStr+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short'})}</div>
+        <div style="font-size:10px;font-weight:700;color:${clr};margin-top:3px">${hasData?fmtS(spent):'—'}</div>
+      </div>`;
+    }).join('')}
+  </div>
+  <p style="font-size:10.5px;color:var(--txm);margin-top:10px;text-align:center">Target per hari ≈ ${fmt(target)} · Klik hari untuk lihat rincian.</p>`;
+}
+
+// Pilihan lihat di Transaksi atau Kalender — sesuai permintaan: user pilih dulu mau lihat di mana
+window.openPeriodChoice = function(categoryId, periodType, key) {
+  const c = catObj(categoryId);
+  openModal(`
+  <div class="modal-header"><h3>Lihat "${esc(c.name)}"</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
+  <div class="modal-body" style="display:flex;flex-direction:column;gap:10px">
+    <button class="btn" style="justify-content:center;padding:14px" onclick='goToTransaksiFiltered(${JSON.stringify(categoryId)},${JSON.stringify(periodType)},${JSON.stringify(key)})'><i class="fa-solid fa-right-left"></i> Lihat di Transaksi</button>
+    <button class="btn" style="justify-content:center;padding:14px" onclick='goToKalenderFiltered(${JSON.stringify(periodType)},${JSON.stringify(key)})'><i class="fa-solid fa-calendar-days"></i> Lihat di Kalender</button>
+  </div>
+  <div class="modal-footer"><button class="btn" onclick="closeModal()">Batal</button></div>`);
+};
+window.goToTransaksiFiltered = function(categoryId, periodType, key) {
+  const c = catObj(categoryId);
+  txnFilter.search = c.name.toLowerCase();
+  txnFilter.type = 'expense';
+  if (periodType === 'bulanan') txnFilter.month = `${key.y}-${String(key.m).padStart(2,'0')}`;
+  else if (periodType === 'tahunan') txnFilter.month = String(key.y);
+  else if (periodType === 'harian') txnFilter.month = key.date.slice(0,7);
+  else if (periodType === 'mingguan') txnFilter.month = key.start.slice(0,7);
+  closeModal(); nav('transactions');
+};
+window.goToKalenderFiltered = function(periodType, key) {
+  let y, m, dateStr = null;
+  if (periodType === 'bulanan') { y=key.y; m=key.m-1; }
+  else if (periodType === 'tahunan') { y=key.y; m=0; }
+  else if (periodType === 'harian') { const d=new Date(key.date+'T00:00:00'); y=d.getFullYear(); m=d.getMonth(); dateStr=key.date; }
+  else { const d=new Date(key.start+'T00:00:00'); y=d.getFullYear(); m=d.getMonth(); }
+  _calYear = y; _calMonth = m;
+  closeModal(); nav('calendar');
+  if (dateStr) setTimeout(() => calDayClick(dateStr), 120);
 };
 
 /* ── HUTANG & PIUTANG ──
@@ -2508,45 +2800,80 @@ window.delGoal = function(id) {
    mode 'nominal'  → progres OTOMATIS dihitung dari transaksi asli (sinkron, bukan manual)
    mode 'checklist'→ target bebas (jadwal/kebiasaan), ditandai selesai manual per periode */
 const TARGET_TABS = [
-  { id:'harian',  label:'Harian',  icon:'fa-sun' },
-  { id:'bulanan', label:'Bulanan', icon:'fa-calendar-week' },
-  { id:'tahunan', label:'Tahunan', icon:'fa-calendar-days' }
+  { id:'harian',   label:'Harian',   icon:'fa-sun' },
+  { id:'mingguan', label:'Mingguan', icon:'fa-calendar-week' },
+  { id:'bulanan',  label:'Bulanan',  icon:'fa-calendar-days' },
+  { id:'tahunan',  label:'Tahunan',  icon:'fa-calendar' }
 ];
 function rTargets(el) {
   el.innerHTML = `
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px">
-    <div><h3 style="font-size:17px;font-weight:700">Target Berkala</h3><p style="font-size:12.5px;color:var(--tx2);margin-top:3px">Rencanakan target harian, bulanan, dan tahunan Anda sendiri</p></div>
-    <button class="btn btn-primary btn-sm" onclick="openTargetModal()"><i class="fa-solid fa-plus"></i> Tambah Target</button>
+    <div><h3 style="font-size:17px;font-weight:700">Target Berkala</h3><p style="font-size:12.5px;color:var(--tx2);margin-top:3px">Harian, mingguan, bulanan, tahunan — evaluasi berjenjang otomatis</p></div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-sm" onclick="openBulkChecklistModal()"><i class="fa-solid fa-list-ul"></i> Tambah Banyak</button>
+      <button class="btn btn-primary btn-sm" onclick="openTargetModal()"><i class="fa-solid fa-plus"></i> Tambah Target</button>
+    </div>
   </div>
-  <div class="type-toggle" id="target-tabs" style="max-width:420px;margin-bottom:18px">
+  <div class="type-toggle" id="target-tabs" style="max-width:520px;margin-bottom:18px">
     ${TARGET_TABS.map(t=>`<button class="${_targetTab===t.id?'sel-active':''}" data-tab="${t.id}"><i class="fa-solid ${t.icon}" style="margin-right:5px;font-size:10px"></i>${t.label}</button>`).join('')}
   </div>
+  <div id="target-rekap" style="margin-bottom:16px"></div>
   <div class="grid-auto" id="target-grid"></div>`;
 
   document.querySelectorAll('#target-tabs button').forEach(b => {
     b.onclick = () => { _targetTab = b.dataset.tab; renderPage(); };
   });
+  fillTargetRekap();
   fillTargetGrid();
+}
+
+function fillTargetRekap() {
+  const wrap = document.getElementById('target-rekap'); if (!wrap) return;
+  const n = new Date();
+  if (_targetTab === 'bulanan') {
+    const r = rekapMingguanUntukBulan(n.getFullYear(), n.getMonth()+1);
+    wrap.innerHTML = r ? `<div class="card" style="background:var(--acc-l);border-color:transparent">
+      <div style="display:flex;align-items:center;gap:10px">
+        <i class="fa-solid fa-layer-group" style="color:var(--acc)"></i>
+        <div><b>Rekap Mingguan → Bulan Ini:</b> ${r.done}/${r.total} target mingguan tercapai (${MO_FULL[n.getMonth()]})</div>
+      </div></div>` : '';
+  } else if (_targetTab === 'tahunan') {
+    const r = rekapBulananUntukTahun(n.getFullYear());
+    wrap.innerHTML = r ? `<div class="card" style="background:var(--acc-l);border-color:transparent">
+      <div style="display:flex;align-items:center;gap:10px">
+        <i class="fa-solid fa-layer-group" style="color:var(--acc)"></i>
+        <div><b>Rekap Bulanan → Tahun Ini:</b> ${r.done}/${r.total} target bulanan tercapai (${n.getFullYear()})</div>
+      </div></div>` : '';
+  } else {
+    wrap.innerHTML = '';
+  }
 }
 
 function fillTargetGrid() {
   const grid = document.getElementById('target-grid'); if (!grid) return;
   const list = S.targets.filter(t => t.period === _targetTab);
   if (!list.length) {
-    grid.innerHTML = `<div class="card empty-state" style="grid-column:1/-1"><i class="fa-solid fa-list-check"></i><p>Belum ada target ${_targetTab}. Tambahkan target Anda sendiri — bisa nominal (otomatis sinkron dengan transaksi) atau checklist kebiasaan.</p></div>`;
+    grid.innerHTML = `<div class="card empty-state" style="grid-column:1/-1"><i class="fa-solid fa-list-check"></i><p>Belum ada target ${_targetTab}. Bisa Nominal (otomatis sinkron transaksi), Checklist (kebiasaan), atau Jadwal Harian (jam per jam).</p></div>`;
     return;
   }
   const pKey = currentPeriodKey(_targetTab);
-  grid.innerHTML = list.map(t => {
+
+  // Mode Jadwal ditampilkan penuh 1 kolom (timeline), sisanya di grid biasa
+  const jadwalList = list.filter(t=>t.mode==='jadwal');
+  const others = list.filter(t=>t.mode!=='jadwal');
+
+  grid.innerHTML =
+    jadwalList.map(t => renderJadwalCard(t)).join('') +
+    others.map(t => {
     if (t.mode === 'nominal') {
       const p = targetProgress(t);
-      const achieved = t.goalType === 'hemat' ? p.actual >= p.target : p.actual <= p.target;
+      const achieved = t.basis==='kategori' ? p.actual>=p.target : (t.goalType === 'hemat' ? p.actual >= p.target : p.actual <= p.target);
       const color = achieved ? 'var(--income)' : (p.pct>=80 ? 'var(--gold)' : 'var(--acc)');
       return `<div class="card">
         <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px">
           <div>
             <div style="font-weight:700;font-size:14px">${esc(t.title)}</div>
-            <div style="font-size:11px;color:var(--txm)">${t.goalType==='hemat'?'Target hemat (pemasukan − pengeluaran)':'Batas maksimal pengeluaran'} · Otomatis dari transaksi</div>
+            <div style="font-size:11px;color:var(--txm)">${t.basis==='kategori'?`% dari kategori "${esc(catObj(t.incomeCatId).name)}" → "${esc(catObj(t.expenseCatId).name)}"`:(t.goalType==='hemat'?'Target hemat (pemasukan − pengeluaran)':'Batas maksimal pengeluaran')} · Otomatis dari transaksi</div>
           </div>
           <div style="display:flex;gap:4px">
             <button class="btn-icon" style="width:27px;height:27px" onclick="openTargetModal('${t.id}')"><i class="fa-solid fa-pen" style="font-size:9px"></i></button>
@@ -2555,8 +2882,8 @@ function fillTargetGrid() {
         </div>
         <div class="progress-bar"><div class="progress-fill" style="width:${p.pct}%;background:${color}"></div></div>
         <div style="display:flex;justify-content:space-between;margin-top:7px;font-size:12.5px">
-          <span style="color:${color};font-weight:600">${fmt(p.actual)}</span>
-          <span style="color:var(--txm)">target ${fmt(p.target)}</span>
+          <span style="color:${color};font-weight:600">${p.isPercent?p.actual+'%':fmt(p.actual)}</span>
+          <span style="color:var(--txm)">target ${p.isPercent?p.target+'%':fmt(p.target)}</span>
         </div>
         ${achieved?`<div style="margin-top:8px"><span class="badge" style="background:var(--income-l);color:var(--income)"><i class="fa-solid fa-check"></i> Tercapai</span></div>`:''}
       </div>`;
@@ -2581,36 +2908,112 @@ function fillTargetGrid() {
   }).join('');
 }
 
+// ── Kartu mode Jadwal — timeline hari ini (otomatis pilih varian Senin-Jumat/Sabtu/Minggu) ──
+function renderJadwalCard(t) {
+  const variant = todayVariantKey();
+  const variantLabel = { weekday:'Senin–Jumat', saturday:'Sabtu', sunday:'Minggu' }[variant];
+  const blocks = scheduleBlocksFor(t, variant);
+  const dateStr = today();
+  const doneList = (t.completedBlocks && t.completedBlocks[dateStr]) || [];
+  const doneCount = blocks.filter((b,i)=>doneList.includes(i)).length;
+  return `<div class="card" style="grid-column:1/-1">
+    <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px">
+      <div>
+        <div style="font-weight:700;font-size:14px"><i class="fa-solid fa-clock" style="color:${t.color||'var(--acc)'};margin-right:6px"></i>${esc(t.title)}</div>
+        <div style="font-size:11px;color:var(--txm)">Jadwal hari ini (${variantLabel}) · ${doneCount}/${blocks.length} selesai</div>
+      </div>
+      <div style="display:flex;gap:4px">
+        <button class="btn-icon" style="width:27px;height:27px" onclick="openTargetModal('${t.id}')"><i class="fa-solid fa-pen" style="font-size:9px"></i></button>
+        <button class="btn-icon" style="width:27px;height:27px;color:var(--expense)" onclick="delTarget('${t.id}')"><i class="fa-solid fa-trash" style="font-size:9px"></i></button>
+      </div>
+    </div>
+    ${!blocks.length ? `<div class="empty-state" style="padding:14px"><p style="font-size:12px">Belum ada jadwal untuk hari ini (${variantLabel}). Klik edit untuk mengisi.</p></div>` :
+    `<div class="ladder-track">${blocks.map((b,i)=>{
+      const done = doneList.includes(i);
+      return `<div class="ladder-step${done?' done':''}">
+        <div class="ladder-step-num" style="background:${done?'var(--income)':'var(--bg)'};color:${done?'#fff':'var(--tx2)'};box-shadow:${done?'0 0 0 3px var(--income-l)':'var(--neu-raised-sm)'};font-size:9.5px;cursor:pointer" onclick="toggleScheduleBlock('${t.id}',${i})">${done?'<i class="fa-solid fa-check"></i>':i+1}</div>
+        <div class="ladder-step-body">
+          <div style="font-size:12.5px;${done?'text-decoration:line-through;color:var(--txm)':''}"><b>${b.start}–${b.end}</b> ${esc(b.activity)}</div>
+        </div>
+      </div>`;
+    }).join('')}</div>`}
+  </div>`;
+}
+window.toggleScheduleBlock = async function(id, idx) {
+  const t = S.targets.find(x=>x.id===id); if (!t) return;
+  const dateStr = today();
+  const cb = { ...(t.completedBlocks||{}) };
+  const list = new Set(cb[dateStr]||[]);
+  if (list.has(idx)) list.delete(idx); else list.add(idx);
+  cb[dateStr] = [...list];
+  try { await fbSaveTarget({ completedBlocks: cb }, id); renderPage(); }
+  catch(e) { toast('Gagal: '+e.message,'error'); }
+};
+
 let _targetMode = 'nominal';
+let _targetBasis = 'total';
 window.openTargetModal = function(editId) {
   const t = editId ? S.targets.find(x=>x.id===editId) : null;
   _targetMode = t ? t.mode : 'nominal';
-  const period = t ? t.period : _targetTab;
+  _targetBasis = t ? (t.basis||'total') : 'total';
+  const period = t ? t.period : (_targetTab==='harian'||_targetTab==='mingguan'||_targetTab==='bulanan'||_targetTab==='tahunan' ? _targetTab : 'harian');
+  const incomeCats = S.categories.filter(c=>c.type==='income');
+  const expenseCats = S.categories.filter(c=>c.type==='expense');
   openModal(`
-  <div class="modal-header"><h3>${t?'Edit':'Tambah'} Target ${TARGET_TABS.find(x=>x.id===period)?.label||''}</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
+  <div class="modal-header"><h3>${t?'Edit':'Tambah'} Target</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
   <div class="modal-body">
     <div class="form-group"><label class="form-label">Periode</label>
       <select class="form-input" id="tf-period">${TARGET_TABS.map(x=>`<option value="${x.id}"${period===x.id?' selected':''}>${x.label}</option>`).join('')}</select>
     </div>
     <div class="form-group"><label class="form-label">Mode</label>
       <div class="type-toggle" id="tmtog">
-        <button class="${_targetMode==='nominal'?'sel-active':''}" data-m="nominal">Nominal (Otomatis)</button>
-        <button class="${_targetMode==='checklist'?'sel-active':''}" data-m="checklist">Checklist (Manual)</button>
+        <button class="${_targetMode==='nominal'?'sel-active':''}" data-m="nominal">Nominal</button>
+        <button class="${_targetMode==='checklist'?'sel-active':''}" data-m="checklist">Checklist</button>
+        <button class="${_targetMode==='jadwal'?'sel-active':''}" data-m="jadwal">Jadwal Harian</button>
       </div>
     </div>
-    <div class="form-group"><label class="form-label">Judul Target</label><input type="text" class="form-input" id="tf-title" placeholder="Contoh: Hemat harian / Olahraga rutin" value="${esc(t?t.title:'')}" maxlength="60"></div>
+    <div class="form-group"><label class="form-label">Judul Target</label><input type="text" class="form-input" id="tf-title" placeholder="Contoh: Hemat harian / Jadwal Harian / Invest dari Ngojol" value="${esc(t?t.title:'')}" maxlength="60"></div>
 
     <div id="tf-nominal-fields" style="${_targetMode!=='nominal'?'display:none':''}">
-      <div class="form-group"><label class="form-label">Jenis</label>
-        <select class="form-input" id="tf-goaltype">
-          <option value="hemat"${t&&t.goalType==='hemat'?' selected':''}>Target Hemat (pemasukan − pengeluaran ≥ nominal)</option>
-          <option value="batas"${t&&t.goalType==='batas'?' selected':''}>Batas Pengeluaran (pengeluaran ≤ nominal)</option>
-        </select>
+      <div class="form-group"><label class="form-label">Basis Perhitungan</label>
+        <div class="type-toggle" id="tbtog">
+          <button class="${_targetBasis==='total'?'sel-active':''}" data-b="total">Total Keseluruhan</button>
+          <button class="${_targetBasis==='kategori'?'sel-active':''}" data-b="kategori">% dari Kategori Tertentu</button>
+        </div>
       </div>
-      <div class="form-group"><label class="form-label">Jumlah Target</label><input type="text" class="form-input" id="tf-amount" placeholder="0" inputmode="numeric" value="${t&&t.amount?groupInt(t.amount):''}" oninput="liveFormatAmount(this)"></div>
+      <div id="tf-total-fields" style="${_targetBasis!=='total'?'display:none':''}">
+        <div class="form-group"><label class="form-label">Jenis</label>
+          <select class="form-input" id="tf-goaltype">
+            <option value="hemat"${t&&t.goalType==='hemat'?' selected':''}>Target Hemat (pemasukan − pengeluaran ≥ nominal)</option>
+            <option value="batas"${t&&t.goalType==='batas'?' selected':''}>Batas Pengeluaran (pengeluaran ≤ nominal)</option>
+          </select>
+        </div>
+        <div class="form-group"><label class="form-label">Jumlah Target (Rp)</label><input type="text" class="form-input" id="tf-amount" placeholder="0" inputmode="numeric" value="${t&&t.basis!=='kategori'&&t.amount?groupInt(t.amount):''}" oninput="liveFormatAmount(this)"></div>
+      </div>
+      <div id="tf-kategori-fields" style="${_targetBasis!=='kategori'?'display:none':''}">
+        <p style="font-size:11px;color:var(--txm);margin-bottom:8px">Contoh: "Invest 20% dari income Ngojol" → pilih kategori pemasukan "Ngojol"/"Freelance", kategori pengeluaran "Investasi", target 20%.</p>
+        <div class="grid-2">
+          <div class="form-group"><label class="form-label">Kategori Pemasukan (penyebut)</label><select class="form-input" id="tf-inccat">${incomeCats.map(c=>`<option value="${c.id}"${t&&t.incomeCatId===c.id?' selected':''}>${esc(c.name)}</option>`).join('')}</select></div>
+          <div class="form-group"><label class="form-label">Kategori Pengeluaran (pembilang)</label><select class="form-input" id="tf-expcat">${expenseCats.map(c=>`<option value="${c.id}"${t&&t.expenseCatId===c.id?' selected':''}>${esc(c.name)}</option>`).join('')}</select></div>
+        </div>
+        <div class="form-group"><label class="form-label">Target Persentase (%)</label><input type="number" class="form-input" id="tf-pct" placeholder="20" min="1" max="100" value="${t&&t.basis==='kategori'?t.amount:''}"></div>
+      </div>
     </div>
     <div id="tf-checklist-fields" style="${_targetMode!=='checklist'?'display:none':''}">
       <div class="form-group"><label class="form-label">Deskripsi <span style="font-weight:400;color:var(--txm)">(opsional)</span></label><input type="text" class="form-input" id="tf-desc" placeholder="Contoh: Jalan kaki 30 menit" value="${esc(t?t.description||'':'')}" maxlength="150"></div>
+    </div>
+    <div id="tf-jadwal-fields" style="${_targetMode!=='jadwal'?'display:none':''}">
+      <p style="font-size:11px;color:var(--txm);margin-bottom:8px">Satu baris = satu blok waktu, format: <code>05:00-07:00 Aktivitas</code>. Jadwal Sabtu &amp; Minggu opsional (kalau kosong, hari itu tidak menampilkan jadwal).</p>
+      <div class="form-group"><label class="form-label">Senin – Jumat</label><textarea class="form-input" id="tf-sched-weekday" rows="5" placeholder="05:00-07:00 Mandi, sholat, makan, meditasi, OTW PPL
+07:30-17:00 PPL, sela waktu belajar hal baru
+17:30-18:30 Mandi, makan, sholat, siap-siap pantau market
+18:40-00:00 Belajar hal baru, fokus trading
+00:00-05:00 Siap-siap tidur">${scheduleToText(t?.schedules?.weekday)}</textarea></div>
+      <div class="form-group"><label class="form-label">Sabtu</label><textarea class="form-input" id="tf-sched-saturday" rows="4" placeholder="09:00-16:30 Full ngojol
+17:00-18:00 Mandi, makan, sholat
+18:30-02:00 Belajar hal baru, fokus trading
+02:00-05:00 Tidur">${scheduleToText(t?.schedules?.saturday)}</textarea></div>
+      <div class="form-group"><label class="form-label">Minggu <span style="font-weight:400;color:var(--txm)">(opsional)</span></label><textarea class="form-input" id="tf-sched-sunday" rows="3" placeholder="16:00-18:00 Gym">${scheduleToText(t?.schedules?.sunday)}</textarea></div>
     </div>
   </div>
   <div class="modal-footer"><button class="btn" onclick="closeModal()">Batal</button><button class="btn btn-primary" id="tf-save-btn" onclick="saveTarget('${editId||''}')">${t?'Simpan':'Tambah'}</button></div>`);
@@ -2622,28 +3025,57 @@ window.openTargetModal = function(editId) {
       btn.className = 'sel-active';
       document.getElementById('tf-nominal-fields').style.display   = _targetMode==='nominal'?'':'none';
       document.getElementById('tf-checklist-fields').style.display = _targetMode==='checklist'?'':'none';
+      document.getElementById('tf-jadwal-fields').style.display    = _targetMode==='jadwal'?'':'none';
+      if (_targetMode === 'jadwal') { document.getElementById('tf-period').value='harian'; document.getElementById('tf-period').disabled=true; }
+      else { document.getElementById('tf-period').disabled=false; }
     };
   });
+  document.querySelectorAll('#tbtog button').forEach(btn => {
+    btn.onclick = () => {
+      _targetBasis = btn.dataset.b;
+      document.querySelectorAll('#tbtog button').forEach(b => b.className = '');
+      btn.className = 'sel-active';
+      document.getElementById('tf-total-fields').style.display    = _targetBasis==='total'?'':'none';
+      document.getElementById('tf-kategori-fields').style.display = _targetBasis==='kategori'?'':'none';
+    };
+  });
+  if (_targetMode === 'jadwal') document.getElementById('tf-period').disabled = true;
 };
 window.saveTarget = async function(editId) {
   const period = document.getElementById('tf-period').value;
   const title  = document.getElementById('tf-title').value.trim();
   if (!title) { toast('Judul target harus diisi','error'); return; }
-  let data = { period, mode:_targetMode, title };
+  let data = { period: _targetMode==='jadwal'?'harian':period, mode:_targetMode, title };
   if (_targetMode === 'nominal') {
-    const amount = parseAmount(document.getElementById('tf-amount').value);
-    if (!amount) { toast('Isi jumlah target dengan benar','error'); return; }
-    data.goalType = document.getElementById('tf-goaltype').value;
-    data.amount = amount;
-  } else {
+    data.basis = _targetBasis;
+    if (_targetBasis === 'kategori') {
+      const pct = parseInt(document.getElementById('tf-pct').value, 10);
+      if (!pct || pct<=0) { toast('Isi target persentase dengan benar','error'); return; }
+      data.incomeCatId = document.getElementById('tf-inccat').value;
+      data.expenseCatId = document.getElementById('tf-expcat').value;
+      data.amount = pct;
+    } else {
+      const amount = parseAmount(document.getElementById('tf-amount').value);
+      if (!amount) { toast('Isi jumlah target dengan benar','error'); return; }
+      data.goalType = document.getElementById('tf-goaltype').value;
+      data.amount = amount;
+    }
+  } else if (_targetMode === 'checklist') {
     data.description = document.getElementById('tf-desc').value.trim();
     data.completedPeriods = editId ? (S.targets.find(x=>x.id===editId)?.completedPeriods || []) : [];
+  } else { // jadwal
+    data.schedules = {
+      weekday:  parseScheduleText(document.getElementById('tf-sched-weekday').value),
+      saturday: parseScheduleText(document.getElementById('tf-sched-saturday').value),
+      sunday:   parseScheduleText(document.getElementById('tf-sched-sunday').value),
+    };
+    data.completedBlocks = editId ? (S.targets.find(x=>x.id===editId)?.completedBlocks || {}) : {};
   }
   const btn = document.getElementById('tf-save-btn');
   if (btn) { btn.disabled=true; btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i>'; }
   try {
     await fbSaveTarget(data, editId||null);
-    _targetTab = period;
+    _targetTab = data.period;
     toast(editId?'Target diperbarui':'Target ditambahkan'); closeModal(); renderPage();
   } catch(e) { toast('Gagal: '+e.message,'error'); if(btn){btn.disabled=false;btn.textContent=editId?'Simpan':'Tambah';} }
 };
@@ -2657,6 +3089,34 @@ window.toggleTargetDone = async function(id) {
   if (list.has(pKey)) list.delete(pKey); else list.add(pKey);
   try { await fbSaveTarget({ completedPeriods: [...list] }, id); renderPage(); }
   catch(e) { toast('Gagal: '+e.message,'error'); }
+};
+
+// ── Tambah banyak checklist sekaligus (mis. MAXIM / KULIAH / BELAJAR HAL BARU / IBADAH) ──
+window.openBulkChecklistModal = function() {
+  openModal(`
+  <div class="modal-header"><h3>Tambah Banyak Target Checklist</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
+  <div class="modal-body">
+    <div class="form-group"><label class="form-label">Periode</label>
+      <select class="form-input" id="bc-period">${TARGET_TABS.map(x=>`<option value="${x.id}"${_targetTab===x.id?' selected':''}>${x.label}</option>`).join('')}</select>
+    </div>
+    <div class="form-group"><label class="form-label">Satu judul per baris</label><textarea class="form-input" id="bc-titles" rows="6" placeholder="MAXIM
+KULIAH
+BELAJAR HAL BARU
+IBADAH"></textarea></div>
+  </div>
+  <div class="modal-footer"><button class="btn" onclick="closeModal()">Batal</button><button class="btn btn-primary" id="bc-save-btn" onclick="saveBulkChecklist()">Tambah Semua</button></div>`);
+};
+window.saveBulkChecklist = async function() {
+  const period = document.getElementById('bc-period').value;
+  const titles = document.getElementById('bc-titles').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  if (!titles.length) { toast('Isi minimal 1 judul','error'); return; }
+  const btn = document.getElementById('bc-save-btn');
+  if (btn) { btn.disabled=true; btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> Menyimpan...'; }
+  try {
+    for (const title of titles) await fbSaveTarget({ period, mode:'checklist', title, description:'', completedPeriods:[] }, null);
+    _targetTab = period;
+    toast(`${titles.length} target ditambahkan`); closeModal(); renderPage();
+  } catch(e) { toast('Gagal: '+e.message,'error'); if(btn){btn.disabled=false;btn.textContent='Tambah Semua';} }
 };
 
 /* ── REPORTS ── */
