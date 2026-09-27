@@ -58,7 +58,10 @@ service cloud.firestore {
         && d.name is string && d.name.size() > 0 && d.name.size() <= 50
         && d.type in ['cash','bank','ewallet']
         && d.icon  is string
-        && d.color is string;
+        && d.color is string
+        && (!('purpose' in d)       || d.purpose in ['transaksi','tabungan','lainnya'])
+        && (!('bankName' in d)      || (d.bankName is string && d.bankName.size() <= 30))
+        && (!('accountNumber' in d) || (d.accountNumber is string && d.accountNumber.size() <= 30));
     }
 
     // ── Validasi skema HUTANG / PIUTANG ──
@@ -69,6 +72,7 @@ service cloud.firestore {
         && (!('person' in d)   || (d.person is string && d.person.size() > 0 && d.person.size() <= 60))
         && (!('amount' in d)   || (d.amount is number && d.amount > 0 && d.amount < 999999999999))
         && (!('paid' in d)     || (d.paid is number && d.paid >= 0 && d.paid < 999999999999))
+        && (!('borrowDate' in d) || d.borrowDate is string)
         && (!('dueDate' in d)  || d.dueDate == null || d.dueDate is string)
         && (!('note' in d)     || (d.note is string && d.note.size() <= 200))
         && (!('isKPR' in d)    || d.isKPR is bool);
@@ -89,6 +93,7 @@ service cloud.firestore {
         && (!('amount' in d)   || (d.amount is number && d.amount > 0 && d.amount < 999999999999))
         && (!('completedPeriods' in d) || d.completedPeriods is list)
         && (!('schedules' in d)        || d.schedules is map)
+        && (!('overrides' in d)        || d.overrides is map)
         && (!('completedBlocks' in d)  || d.completedBlocks is map);
     }
 

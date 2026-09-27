@@ -312,10 +312,17 @@ function avgMonthlyRealExpense() {
 function computeLadderProgress(g) {
   const step = g.ladderStep;
   if (step === 1) {
-    const actual = totalBal();
+    const savingsId = S.settings.wealthLadder?.savingsAccountId;
     const target = g.target || 10000000;
+    if (!savingsId) {
+      return { actual:0, target, pct:0, done:false, needsAccount:true,
+        detail:'Belum ada akun tabungan yang terhubung. Nabung Cash dihitung dari saldo akun TABUNGAN Anda saja — bukan total semua akun (supaya uang buat transaksi harian tidak ikut kehitung sebagai tabungan).' };
+    }
+    const acc = S.accounts.find(a=>a.id===savingsId);
+    if (!acc) return { actual:0, target, pct:0, done:false, needsAccount:true, detail:'Akun tabungan yang tersambung sudah tidak ada. Hubungkan ulang.' };
+    const actual = accBal(savingsId);
     return { actual, target, pct: Math.min(Math.max(actual/target,0)*100,100), done: actual >= target,
-      detail: `Total saldo semua akun Anda saat ini: ${fmt(actual)}.` };
+      detail: `Saldo akun tabungan "${esc(acc.name)}" saat ini: ${fmt(actual)}. (Bukan total semua akun — supaya gajian yang lewat untuk transaksi harian tidak ikut kehitung sbg tabungan.)` };
   }
   if (step === 2) {
     const list = S.debts.filter(d => d.type==='hutang' && !d.isKPR);
@@ -382,9 +389,10 @@ function periodTxnsFor(period) {
   return yearTxns(0);
 }
 // Hitung progres nominal target dari data transaksi ASLI (bukan input manual) — inilah "sinkronnya"
-function targetProgress(t) {
+// Digeneralisasi supaya bisa dipakai utk periode MANAPUN (bukan cuma "sekarang") — dipakai navigasi kalender Target Berkala.
+function targetProgressForKey(t, pKey) {
   if (t.mode !== 'nominal') return null;
-  const arr = filterReal(periodTxnsFor(t.period));
+  const arr = filterReal(periodTxnsForKey(t.period, pKey));
   if (t.basis === 'kategori' && t.incomeCatId) {
     // mis. "Invest 20% dari income Ngojol" — persentase dihitung dari kategori SPESIFIK, bukan total
     const incomeAmt = arr.filter(x=>x.type==='income' && x.categoryId===t.incomeCatId).reduce((s,x)=>s+x.amount,0);
@@ -396,6 +404,15 @@ function targetProgress(t) {
   const actual = t.goalType === 'hemat' ? (inc - exp) : exp; // 'hemat'=net saving, 'batas'=total pengeluaran
   return { actual, target: t.amount, pct: t.amount>0 ? Math.min(Math.max(actual/t.amount,0)*100,100) : 0 };
 }
+function targetProgress(t) { return targetProgressForKey(t, currentPeriodKey(t.period)); }
+
+// Navigasi kalender per-tab Target Berkala — setiap tab ingat tanggal/minggu/bulan/tahun yg sedang dilihat
+let _targetHarianDate  = today();
+let _targetMingguMonth = { y: new Date().getFullYear(), m: new Date().getMonth()+1 };
+let _targetMingguKey   = weekStartOf(today());
+let _targetBulanYear   = new Date().getFullYear();
+let _targetBulanKey    = `${new Date().getFullYear()}-${String(new Date().getMonth()+1).padStart(2,'0')}`;
+let _targetTahunYear   = new Date().getFullYear();
 
 // ── Target Berkala mode 'jadwal': jadwal harian ala rencana pribadi, beda hari kerja/Sabtu/Minggu ──
 function todayVariantKey() {
@@ -980,16 +997,33 @@ function budgetNativeSpent(b) {
 }
 function checkBudgetAlerts() {
   const overBudget = S.budgets.filter(b => budgetNativeSpent(b) > b.amount);
+  const overdueDebts = S.debts.filter(d => d.dueDate && d.dueDate <= today() && debtRemaining(d) > 0);
   const dot = document.getElementById('notif-dot');
-  if (dot) dot.classList.toggle('hidden', overBudget.length === 0);
+  if (dot) dot.classList.toggle('hidden', overBudget.length === 0 && overdueDebts.length === 0);
 }
 
 document.getElementById('notif-btn').addEventListener('click', () => {
   const over = S.budgets.filter(b => budgetNativeSpent(b) > b.amount);
-  if (!over.length) { toast('Semua anggaran masih aman', 'info'); return; }
+  const soonCutoff = (() => { const d=new Date(); d.setDate(d.getDate()+3); return localDateStr(d); })();
+  const overdueDebts = S.debts.filter(d => d.dueDate && d.dueDate < today() && debtRemaining(d) > 0);
+  const soonDebts = S.debts.filter(d => d.dueDate && d.dueDate >= today() && d.dueDate <= soonCutoff && debtRemaining(d) > 0);
+  if (!over.length && !overdueDebts.length && !soonDebts.length) { toast('Semua anggaran & jatuh tempo masih aman', 'info'); return; }
   openModal(`
-    <div class="modal-header"><h3><i class="fa-solid fa-bell" style="color:var(--expense);margin-right:8px"></i>Peringatan Anggaran</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
+    <div class="modal-header"><h3><i class="fa-solid fa-bell" style="color:var(--expense);margin-right:8px"></i>Notifikasi</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
     <div class="modal-body">
+      ${overdueDebts.length ? `<div style="font-size:11px;font-weight:800;color:var(--expense);letter-spacing:.4px;margin-bottom:8px">HUTANG/PIUTANG LEWAT JATUH TEMPO</div>
+      ${overdueDebts.map(d=>`<div style="display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--border)">
+        <div style="width:34px;height:34px;border-radius:9px;background:var(--expense-l);color:var(--expense);display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0"><i class="fa-solid fa-hourglass-end"></i></div>
+        <div style="flex:1"><div style="font-weight:600;font-size:12.5px">${esc(d.person)} (${d.type==='hutang'?'Hutang Saya':'Piutang Saya'})</div>
+        <div style="font-size:11px;color:var(--expense)">Jatuh tempo ${new Date(d.dueDate+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short'})} — ${fmt(debtRemaining(d))}</div></div>
+      </div>`).join('')}` : ''}
+      ${soonDebts.length ? `<div style="font-size:11px;font-weight:800;color:var(--gold);letter-spacing:.4px;margin:14px 0 8px">SEGERA JATUH TEMPO (3 HARI)</div>
+      ${soonDebts.map(d=>`<div style="display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--border)">
+        <div style="width:34px;height:34px;border-radius:9px;background:var(--gold-l);color:var(--gold);display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0"><i class="fa-solid fa-clock"></i></div>
+        <div style="flex:1"><div style="font-weight:600;font-size:12.5px">${esc(d.person)} (${d.type==='hutang'?'Hutang Saya':'Piutang Saya'})</div>
+        <div style="font-size:11px;color:var(--gold)">Jatuh tempo ${new Date(d.dueDate+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short'})} — ${fmt(debtRemaining(d))}</div></div>
+      </div>`).join('')}` : ''}
+      ${over.length ? `<div style="font-size:11px;font-weight:800;color:var(--expense);letter-spacing:.4px;margin:14px 0 8px">ANGGARAN MELEBIHI BATAS</div>
       ${over.map(b => {
         const c = catObj(b.categoryId);
         const spent = budgetNativeSpent(b);
@@ -999,9 +1033,12 @@ document.getElementById('notif-btn').addEventListener('click', () => {
           <div style="font-size:11.5px;color:var(--expense)">Terpakai ${fmt(spent)} dari anggaran ${fmt(b.amount)}</div></div>
           <span class="badge" style="background:var(--expense-l);color:var(--expense)">+${fmt(spent-b.amount)} over</span>
         </div>`;
-      }).join('')}
+      }).join('')}` : ''}
     </div>
-    <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal();nav('budgets')">Kelola Anggaran</button></div>`);
+    <div class="modal-footer">
+      ${(overdueDebts.length||soonDebts.length)?`<button class="btn" onclick="closeModal();nav('debts')">Kelola Hutang</button>`:''}
+      ${over.length?`<button class="btn btn-primary" onclick="closeModal();nav('budgets')">Kelola Anggaran</button>`:''}
+    </div>`);
 });
 
 /* ─────────────────────────────────────────
@@ -1330,26 +1367,72 @@ function computeFullAIReport() {
   const ladderProgress = ladderGoals.map(g => ({ g, p: computeLadderProgress(g) }));
   const currentRung = ladderProgress.find(x => !x.p.done); // tangga pertama yang belum tercapai
 
-  // ── Rekomendasi prioritas (diurutkan berdasar urgensi nyata) ──
+  // ── Rekomendasi: tiap masalah dijabarkan MASALAH → BEBERAPA SOLUSI → SOLUSI TERBAIK ──
   const priorities = [];
+  const totalOverdueAmt = overdue.reduce((s,d)=>s+debtRemaining(d),0);
   if (overdue.length) {
+    const canPayNow = totalBal() >= totalOverdueAmt;
     priorities.push({ level:'urgent', icon:'fa-triangle-exclamation',
-      text: `${overdue.length} hutang/piutang sudah lewat jatuh tempo (total ${fmt(overdue.reduce((s,d)=>s+debtRemaining(d),0))}). Segera tindak lanjuti.` });
+      problem: `${overdue.length} hutang/piutang sudah lewat jatuh tempo, total ${fmt(totalOverdueAmt)}.`,
+      solutions: [
+        `Lunasi sekarang dari saldo Anda saat ini (${fmt(totalBal())}) kalau mencukupi.`,
+        'Hubungi pihak terkait untuk menyepakati tanggal bayar baru (restrukturisasi).',
+        'Cicil sebagian dulu untuk menunjukkan iktikad baik, sisanya menyusul bertahap.'
+      ],
+      bestSolution: canPayNow
+        ? `Lunasi sekarang — saldo Anda (${fmt(totalBal())}) masih mencukupi utk menutup ${fmt(totalOverdueAmt)} ini, daripada berlarut jadi masalah kepercayaan.`
+        : 'Hubungi pihak terkait dulu untuk kesepakatan tanggal baru, sambil cicil semampunya — saldo saat ini belum cukup untuk melunasi sekaligus.'
+    });
   }
   if (base.savingsRate < 0) {
+    const deficit = Math.abs(base.inc - base.exp);
     priorities.push({ level:'urgent', icon:'fa-circle-exclamation',
-      text: 'Pengeluaran riil melebihi pendapatan bulan ini. Prioritaskan menekan pengeluaran sebelum menambah komitmen baru.' });
+      problem: `Pengeluaran riil (${fmt(base.exp)}) melebihi pendapatan (${fmt(base.inc)}) bulan ini — minus ${fmt(deficit)}.`,
+      solutions: [
+        topCat ? `Audit kategori pengeluaran terbesar Anda ("${esc(topCat[0])}", ${fmt(topCat[1])}) dan pangkas yang tidak esensial.` : 'Audit kategori pengeluaran terbesar dan pangkas yang tidak esensial.',
+        'Cari tambahan pendapatan jangka pendek untuk menutup selisihnya.',
+        'Tunda pembelian besar yang tidak mendesak sampai bulan depan.'
+      ],
+      bestSolution: topCat
+        ? `Mulai dari kategori "${esc(topCat[0])}" — di situ potensi penghematan Anda paling besar (${fmt(topCat[1])} bulan ini).`
+        : 'Tinjau seluruh transaksi bulan ini dan pangkas pengeluaran non-esensial dulu sebelum mencari pendapatan tambahan.'
+    });
   }
   if (hutang > 0 && hutang > piutang) {
+    const severe = base.debtToIncomeRatio > 1.5;
     priorities.push({ level:'high', icon:'fa-hand-holding-dollar',
-      text: `Hutang (${fmt(hutang)}) lebih besar dari piutang (${fmt(piutang)}). Pertimbangkan melunasi hutang berbunga tinggi lebih dulu sebelum menambah tabungan/investasi baru.` });
+      problem: `Sisa hutang (${fmt(hutang)}) lebih besar dari piutang (${fmt(piutang)}).`,
+      solutions: [
+        'Metode Avalanche: lunasi dulu hutang dengan bunga tertinggi — paling hemat secara total.',
+        'Metode Snowball: lunasi dulu hutang terkecil biar cepat selesai & termotivasi.',
+        'Tagih piutang yang sudah jatuh tempo untuk menyeimbangkan arus kas Anda.'
+      ],
+      bestSolution: severe
+        ? 'Beban hutang Anda cukup besar dibanding pendapatan bulan ini — prioritaskan Avalanche (bunga tertinggi dulu) dan tunda dulu tabungan/investasi baru sampai beban turun.'
+        : 'Beban hutang masih wajar — pilih Snowball (hutang terkecil dulu) kalau butuh motivasi cepat, sambil tetap menabung seperti biasa.'
+    });
   }
   if (currentRung) {
+    const stepSolutions = {
+      needsAccount: ['Hubungkan akun tabungan yang sudah ada lewat Pengaturan.', 'Buat akun baru khusus tabungan dulu di halaman Akun, lalu hubungkan.', 'Lewati dulu tangga ini dan fokus ke tangga lain sambil menyiapkan akun tabungan.'],
+      needsCategory: ['Buat kategori "Investasi" sekali klik lewat tombol di halaman Impian & Tabungan.', 'Catat manual transaksi investasi dengan kategori yang sudah ada dulu.', 'Tunggu sampai siap rutin berinvestasi baru buat kategorinya.'],
+      needsKpr: ['Tandai salah satu Hutang yang sudah dicatat sebagai KPR.', 'Catat dulu KPR Anda di halaman Hutang & Piutang kalau belum ada.', 'Tandai "Tidak punya KPR" di Pengaturan kalau memang tidak relevan.'],
+      needsTarget: ['Set target nominal Dana Pendidikan Anak lewat tombol Edit pada tangga ini.', 'Riset dulu estimasi biaya pendidikan yang realistis sebelum menentukan angka.', 'Mulai dengan angka perkiraan dulu, sesuaikan nanti setelah riset.'],
+    };
+    const needKey = ['needsAccount','needsCategory','needsKpr','needsTarget'].find(k=>currentRung.p[k]);
     priorities.push({ level:'medium', icon: currentRung.g.icon,
-      text: `Fokus Tangga Kekayaan Abadi Anda saat ini: "${esc(currentRung.g.name.replace(/^Tangga \d+: /,''))}" — ${currentRung.p.detail}` });
+      problem: `Fokus Tangga Kekayaan Abadi Anda saat ini: "${esc(currentRung.g.name.replace(/^Tangga \d+: /,''))}" — ${currentRung.p.detail}`,
+      solutions: needKey ? stepSolutions[needKey] : [`Tambah tabungan rutin ke tangga ini.`, `Cek progres berkala lewat tombol "Cek" di halaman Impian & Tabungan.`, `Sesuaikan target kalau dirasa kurang realistis.`],
+      bestSolution: needKey ? stepSolutions[needKey][0] : 'Alokasikan sebagian pendapatan rutin ke tangga ini setiap kali gajian/dapat penghasilan, sekecil apapun — konsistensi lebih penting daripada besar nominal.'
+    });
   }
-  if (base.tips.length) priorities.push({ level:'medium', icon:'fa-lightbulb', text: base.tips[0] });
-  if (!priorities.length) priorities.push({ level:'good', icon:'fa-thumbs-up', text:'Tidak ada isu mendesak terdeteksi. Pertahankan kebiasaan mencatat transaksi secara rutin.' });
+  if (!priorities.length) {
+    priorities.push({ level:'good', icon:'fa-thumbs-up',
+      problem: 'Tidak ada isu mendesak yang terdeteksi dari data Anda saat ini.',
+      solutions: ['Pertahankan kebiasaan mencatat transaksi secara rutin.', 'Tinjau ulang target & anggaran Anda tiap bulan.', 'Mulai pertimbangkan target finansial yang lebih ambisius.'],
+      bestSolution: 'Pertahankan konsistensi mencatat transaksi — itu fondasi semua analisis di halaman ini tetap akurat.'
+    });
+  }
 
   return { ...base, txCount, topCat, nwChange, hutang, piutang, overdue, ladderProgress, currentRung, priorities };
 }
@@ -1366,10 +1449,26 @@ function rAIReport(el) {
   </div>
 
   <div class="card" style="margin-bottom:16px">
-    <h4 style="font-size:13px;font-weight:800;letter-spacing:.4px;margin-bottom:12px;color:var(--tx2)">🎯 REKOMENDASI PRIORITAS</h4>
-    ${r.priorities.map(p => `<div style="display:flex;gap:11px;align-items:flex-start;padding:11px 13px;border-radius:10px;margin-bottom:8px;background:${lvBg[p.level]}">
-      <i class="fa-solid ${p.icon}" style="color:${lvColor[p.level]};margin-top:2px;flex-shrink:0"></i>
-      <span style="font-size:12.5px;color:var(--tx);line-height:1.5">${p.text}</span>
+    <h4 style="font-size:13px;font-weight:800;letter-spacing:.4px;margin-bottom:14px;color:var(--tx2)">🎯 MASALAH, SOLUSI & REKOMENDASI</h4>
+    ${r.priorities.map((p,idx) => `<div style="border-radius:12px;margin-bottom:${idx<r.priorities.length-1?'16px':'0'};overflow:hidden;border:1px solid var(--border)">
+      <div style="display:flex;gap:11px;align-items:flex-start;padding:12px 14px;background:${lvBg[p.level]}">
+        <i class="fa-solid ${p.icon}" style="color:${lvColor[p.level]};margin-top:2px;flex-shrink:0"></i>
+        <div>
+          <div style="font-size:10px;font-weight:800;letter-spacing:.5px;color:${lvColor[p.level]};text-transform:uppercase;margin-bottom:3px">${p.level==='good'?'STATUS':'MASALAH'}</div>
+          <span style="font-size:12.5px;color:var(--tx);line-height:1.5;font-weight:600">${p.problem}</span>
+        </div>
+      </div>
+      ${p.solutions && p.solutions.length ? `<div style="padding:12px 14px;background:var(--bg)">
+        <div style="font-size:10px;font-weight:800;letter-spacing:.5px;color:var(--txm);text-transform:uppercase;margin-bottom:8px">Beberapa Solusi</div>
+        ${p.solutions.map(s=>`<div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px;font-size:12px;color:var(--tx2);line-height:1.5">
+          <i class="fa-regular fa-circle" style="font-size:6px;margin-top:5px;flex-shrink:0;color:var(--txm)"></i><span>${s}</span>
+        </div>`).join('')}
+        ${p.bestSolution ? `<div style="display:flex;gap:9px;align-items:flex-start;margin-top:10px;padding:10px 12px;border-radius:9px;background:var(--income-l)">
+          <i class="fa-solid fa-star" style="color:var(--income);margin-top:2px;flex-shrink:0"></i>
+          <div><div style="font-size:10px;font-weight:800;letter-spacing:.4px;color:var(--income);text-transform:uppercase;margin-bottom:3px">Solusi Terbaik</div>
+          <span style="font-size:12.5px;color:var(--tx);line-height:1.5">${p.bestSolution}</span></div>
+        </div>` : ''}
+      </div>` : ''}
     </div>`).join('')}
   </div>
 
@@ -1574,6 +1673,9 @@ function rCal(el) {
     if (!txnsByDate[t.date]) txnsByDate[t.date] = [];
     txnsByDate[t.date].push(t);
   });
+  // Jatuh tempo hutang/piutang yang masih berjalan — disinkronkan ke tampilan kalender
+  const debtsByDue = {};
+  S.debts.forEach(d => { if (d.dueDate && debtRemaining(d) > 0) { (debtsByDue[d.dueDate] = debtsByDue[d.dueDate]||[]).push(d); } });
 
   const monthTx  = filterReal(S.transactions.filter(t => t.date.startsWith(`${y}-${String(m+1).padStart(2,'0')}`)));
   const monthInc = sumType(monthTx,'income');
@@ -1594,7 +1696,8 @@ function rCal(el) {
     const inc  = sumType(realTxns,'income');
     const exp  = sumType(realTxns,'expense');
     const hasDebtFlow = txns.some(t => !isRealFlow(t));
-    cells.push({ day: d, type: 'current', dateStr, txns, inc, exp, hasDebtFlow });
+    const dueDebts = debtsByDue[dateStr] || [];
+    cells.push({ day: d, type: 'current', dateStr, txns, inc, exp, hasDebtFlow, dueDebts });
   }
   const remaining = (7 - (cells.length % 7)) % 7;
   for (let i = 1; i <= remaining; i++) cells.push({ day: i, type: 'next' });
@@ -1670,6 +1773,7 @@ function rCal(el) {
         ${hasExp ? `<div class="cal-expense-pill"><i class="fa-solid fa-minus" style="font-size:7px"></i>${fmtS(c.exp)}</div>` : ''}
         ${hasTxn && !hasInc && !hasExp ? `<div style="width:5px;height:5px;border-radius:50%;background:var(--acc);margin:4px auto 0;box-shadow:0 0 4px var(--acc)"></div>` : ''}
         ${c.hasDebtFlow ? `<div title="Ada arus kas Hutang/Piutang di hari ini" style="width:5px;height:5px;border-radius:50%;background:#8A90A8;margin:3px auto 0"></div>` : ''}
+        ${c.dueDebts && c.dueDebts.length ? `<div class="badge" title="Jatuh tempo: ${c.dueDebts.map(d=>esc(d.person)).join(', ')}" style="background:var(--expense-l);color:var(--expense);font-size:8px;padding:1px 5px;margin-top:2px"><i class="fa-solid fa-hourglass-end" style="font-size:7px"></i> ${c.dueDebts.length>1?c.dueDebts.length+'x tempo':'Tempo'}</div>` : ''}
       </div>`;
     }).join('')}
   </div>`;
@@ -1696,6 +1800,15 @@ window.calDayClick = function(dateStr) {
   const inc   = sumType(txns,'income');
   const exp   = sumType(txns,'expense');
   const net   = inc - exp;
+  const dueDebts = S.debts.filter(dt => dt.dueDate === dateStr && debtRemaining(dt) > 0);
+  const dueNotice = dueDebts.length ? `
+    <div style="padding:12px;border-radius:10px;background:var(--expense-l);margin-bottom:16px">
+      <div style="font-weight:700;font-size:12.5px;color:var(--expense);margin-bottom:6px"><i class="fa-solid fa-hourglass-end"></i> Jatuh Tempo Hari Ini</div>
+      ${dueDebts.map(dt=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;font-size:12px">
+        <span>${esc(dt.person)} (${dt.type==='hutang'?'Hutang Saya':'Piutang Saya'})</span>
+        <button class="btn btn-sm" style="padding:4px 10px" onclick="closeModal();nav('debts')">${fmt(debtRemaining(dt))}</button>
+      </div>`).join('')}
+    </div>` : '';
 
   if (!txns.length) {
     openModal(`
@@ -1707,6 +1820,7 @@ window.calDayClick = function(dateStr) {
         <button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button>
       </div>
       <div class="modal-body">
+        ${dueNotice}
         <div class="empty-state" style="padding:24px 0">
           <i class="fa-solid fa-calendar-xmark" style="font-size:36px;opacity:.3"></i>
           <p style="font-size:13px;margin-top:10px;color:var(--txm)">Tidak ada transaksi pada tanggal ini</p>
@@ -1762,6 +1876,7 @@ window.calDayClick = function(dateStr) {
     </div>
     <div class="modal-body">
 
+      ${dueNotice}
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:18px">
         <div style="padding:10px;border-radius:10px;background:var(--income-l);border:1px solid rgba(61,219,160,0.2);text-align:center">
           <div style="font-size:9.5px;font-weight:700;color:var(--income);letter-spacing:.4px;text-transform:uppercase;margin-bottom:4px">
@@ -2321,10 +2436,11 @@ function fillDebtGrid() {
           </div>
           <div>
             <div style="font-weight:700;font-size:14px">${esc(d.person)}</div>
-            <div style="font-size:11px;color:var(--txm)">${isHutang?'Saya berhutang':'Berhutang ke saya'}${d.dueDate?' · Jatuh tempo '+new Date(d.dueDate).toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'}):''}</div>
+            <div style="font-size:11px;color:var(--txm)">${isHutang?'Saya berhutang':'Berhutang ke saya'}${d.borrowDate?' · Pinjam '+new Date(d.borrowDate+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'}):''}${d.dueDate?' · Jatuh tempo '+new Date(d.dueDate+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'}):''}</div>
           </div>
         </div>
         <div style="display:flex;gap:4px">
+          <button class="btn-icon" style="width:27px;height:27px" onclick="openDebtHistoryModal('${d.id}')" title="Riwayat transaksi"><i class="fa-solid fa-clock-rotate-left" style="font-size:9px"></i></button>
           <button class="btn-icon" style="width:27px;height:27px" onclick="openDebtModal('${d.id}')"><i class="fa-solid fa-pen" style="font-size:9px"></i></button>
           <button class="btn-icon" style="width:27px;height:27px;color:var(--expense)" onclick="delDebt('${d.id}')"><i class="fa-solid fa-trash" style="font-size:9px"></i></button>
         </div>
@@ -2361,7 +2477,10 @@ window.openDebtModal = function(editId) {
       <div class="form-group"><label class="form-label">Jumlah Pokok</label><input type="text" class="form-input" id="df-amt" placeholder="0" inputmode="numeric" value="${d?groupInt(d.amount):''}" oninput="liveFormatAmount(this)"></div>
       <div class="form-group"><label class="form-label">Sudah Dibayar</label><input type="text" class="form-input" id="df-paid" placeholder="0" inputmode="numeric" value="${d?groupInt(d.paid||0):'0'}" ${d?'':'disabled'} oninput="liveFormatAmount(this)"></div>
     </div>
-    <div class="form-group"><label class="form-label">Jatuh Tempo <span style="font-weight:400;color:var(--txm)">(opsional)</span></label><input type="date" class="form-input" id="df-due" value="${d?d.dueDate||'':''}"></div>
+    <div class="grid-2">
+      <div class="form-group"><label class="form-label" id="df-borrow-label">Tanggal Pinjam</label><input type="date" class="form-input" id="df-borrowdate" value="${d?d.borrowDate||today():today()}"></div>
+      <div class="form-group"><label class="form-label">Jatuh Tempo <span style="font-weight:400;color:var(--txm)">(opsional)</span></label><input type="date" class="form-input" id="df-due" value="${d?d.dueDate||'':''}"></div>
+    </div>
     <div class="form-group"><label class="form-label">Catatan <span style="font-weight:400;color:var(--txm)">(opsional)</span></label><input type="text" class="form-input" id="df-note" placeholder="Contoh: Pinjam untuk modal usaha" value="${esc(d?d.note||'':'')}" maxlength="200"></div>
     <div id="df-kpr-wrap" style="${type==='hutang'?'':'display:none'}">
       <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--tx2);cursor:pointer;margin-bottom:10px">
@@ -2376,10 +2495,8 @@ window.openDebtModal = function(editId) {
         <span id="df-astxn-label">Catat juga penerimaan dana ke akun (uang benar-benar masuk ke dompet saya)</span>
       </label>
       <div id="df-astxn-fields" style="margin-top:10px">
-        <div class="grid-2">
-          <div class="form-group" style="margin-bottom:0"><label class="form-label">Akun</label><select class="form-input" id="df-acc">${S.accounts.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select></div>
-          <div class="form-group" style="margin-bottom:0"><label class="form-label">Tanggal</label><input type="date" class="form-input" id="df-date" value="${today()}"></div>
-        </div>
+        <div class="form-group" style="margin-bottom:0"><label class="form-label">Akun</label><select class="form-input" id="df-acc">${S.accounts.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select></div>
+        <p style="font-size:10.5px;color:var(--txm);margin-top:6px;margin-bottom:0">Pakai tanggal "Tanggal Pinjam" di atas — otomatis tersambung ke Kalender & Transaksi di tanggal itu juga.</p>
       </div>
       <p style="font-size:10.5px;color:var(--txm);margin-top:8px;margin-bottom:0">Dana ini <b>tidak</b> dihitung sebagai pendapatan/pengeluaran di Dashboard & Laporan — cuma pergerakan kas nyata.</p>
     </div>` : ''}
@@ -2389,10 +2506,13 @@ window.openDebtModal = function(editId) {
   let _dType = type;
   const updateAstxnLabel = () => {
     const lbl = document.getElementById('df-astxn-label');
+    const bl  = document.getElementById('df-borrow-label');
     if (lbl) lbl.textContent = _dType === 'hutang'
       ? 'Catat juga penerimaan dana ke akun (uang benar-benar masuk ke dompet saya)'
       : 'Catat juga pengeluaran dana dari akun (uang benar-benar keluar dari dompet saya)';
+    if (bl) bl.textContent = _dType === 'hutang' ? 'Tanggal Pinjam (terima uang)' : 'Tanggal Beri Pinjaman';
   };
+  updateAstxnLabel();
   document.querySelectorAll('#dtog button').forEach(btn => {
     btn.onclick = () => {
       _dType = btn.dataset.t;
@@ -2410,27 +2530,29 @@ window.saveDebt = async function(editId) {
   const person = document.getElementById('df-person').value.trim();
   const amount = parseAmount(document.getElementById('df-amt').value);
   const paid   = parseAmount(document.getElementById('df-paid').value) ?? 0;
+  const borrowDate = document.getElementById('df-borrowdate').value || today();
   const dueDate= document.getElementById('df-due').value || null;
   const note   = document.getElementById('df-note').value.trim();
   const isKPR  = type === 'hutang' && document.getElementById('df-iskpr').checked;
   if (!person || !amount) { toast('Harap isi nama & jumlah dengan benar','error'); return; }
   if (paid > amount) { toast('Jumlah terbayar tidak boleh melebihi total','error'); return; }
+  if (dueDate && dueDate < borrowDate) { toast('Jatuh tempo tidak boleh sebelum tanggal pinjam','error'); return; }
   const btn = document.getElementById('df-save-btn');
   if (btn) { btn.disabled=true; btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i>'; }
   try {
-    const newId = await fbSaveDebt({ type, person, amount, paid, dueDate, note, isKPR }, editId||null);
+    const newId = await fbSaveDebt({ type, person, amount, paid, borrowDate, dueDate, note, isKPR }, editId||null);
 
     // Kalau ini pencatatan BARU dan user centang "catat penerimaan/pengeluaran dana",
     // buat transaksi arus-kas bertanda flow:'hutang' — supaya saldo akun akurat TAPI
-    // tidak mencemari statistik pendapatan/pengeluaran riil.
+    // tidak mencemari statistik pendapatan/pengeluaran riil. Tanggalnya SAMA dengan
+    // Tanggal Pinjam, jadi otomatis muncul di Kalender & Transaksi pada hari itu juga.
     const astxnBox = document.getElementById('df-astxn');
     if (!editId && astxnBox && astxnBox.checked) {
       const accId = document.getElementById('df-acc').value;
-      const date  = document.getElementById('df-date').value || today();
       const isHutang = type === 'hutang';
       const cat = await ensureDebtCategory(isHutang ? 'income' : 'expense');
       await fbAddTxn({
-        date, amount, categoryId: cat.id, accountId: accId,
+        date: borrowDate, amount, categoryId: cat.id, accountId: accId,
         description: (isHutang ? 'Menerima pinjaman dari ' : 'Memberi pinjaman ke ') + person,
         note: '', type: isHutang ? 'income' : 'expense', flow: 'hutang', debtId: newId
       });
@@ -2453,6 +2575,37 @@ window.delDebt = function(id) {
   confirmDel('Hapus catatan hutang/piutang ini? Riwayat pembayaran juga akan hilang (transaksi terkait tidak otomatis terhapus).', async () => {
     await fbDelDebt(id); toast('Data dihapus','info'); renderPage();
   });
+};
+
+// Riwayat lengkap transaksi yang terhubung ke catatan hutang/piutang ini
+// (pencairan awal + semua cicilan) — klik salah satu utk lompat ke Kalender.
+window.openDebtHistoryModal = function(id) {
+  const d = S.debts.find(x=>x.id===id); if (!d) return;
+  const linked = S.transactions.filter(t => t.debtId === id).sort((a,b)=>new Date(a.date)-new Date(b.date));
+  openModal(`
+  <div class="modal-header"><h3>Riwayat "${esc(d.person)}"</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
+  <div class="modal-body">
+    <div style="display:flex;gap:16px;margin-bottom:14px;font-size:12px;color:var(--tx2);flex-wrap:wrap">
+      <span><i class="fa-solid fa-calendar-plus" style="color:var(--acc)"></i> Pinjam: ${d.borrowDate?new Date(d.borrowDate+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'}):'—'}</span>
+      ${d.dueDate?`<span><i class="fa-solid fa-calendar-day" style="color:var(--expense)"></i> Jatuh tempo: ${new Date(d.dueDate+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'})}</span>`:''}
+    </div>
+    ${!linked.length ? `<div class="empty-state" style="padding:16px"><p style="font-size:12.5px">Belum ada transaksi tersambung (dana awal tidak dicatat sbg transaksi, atau belum ada cicilan).</p></div>` :
+    linked.map(t => `<div style="display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="closeModal();goToKalenderFiltered('harian',{date:'${t.date}'})">
+      <div><div style="font-size:12.5px;font-weight:600">${esc(t.description)}</div><div style="font-size:10.5px;color:var(--txm)">${new Date(t.date+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'})}</div></div>
+      <div style="font-weight:700;color:${t.type==='income'?'var(--income)':'var(--expense)'}">${t.type==='income'?'+':'−'}${fmt(t.amount)}</div>
+    </div>`).join('')}
+    <p style="font-size:10.5px;color:var(--txm);margin-top:10px;text-align:center">Klik salah satu baris untuk lompat ke tanggalnya di Kalender.</p>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick='closeModal();goToTransaksiByPerson(${JSON.stringify(d.person)})'>Lihat di Transaksi</button>
+    <button class="btn btn-primary" onclick="closeModal()">Tutup</button>
+  </div>`);
+};
+window.goToTransaksiByPerson = function(person) {
+  txnFilter.search = person.toLowerCase();
+  txnFilter.type = 'all';
+  txnFilter.month = '';
+  nav('transactions');
 };
 
 // Pembayaran sebagian/lunas — pokok dicatat sbg flow:'hutang' (tidak masuk statistik),
@@ -2519,7 +2672,7 @@ window.savePayDebt = async function(id) {
 function rAcc(el) {
   el.innerHTML = `
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px">
-    <div><h3 style="font-size:17px;font-weight:700">Akun Keuangan</h3><p style="font-size:12.5px;color:var(--tx2);margin-top:3px">Kelola dompet, bank, dan e-wallet</p></div>
+    <div><h3 style="font-size:17px;font-weight:700">Akun Keuangan</h3><p style="font-size:12.5px;color:var(--tx2);margin-top:3px">Kelola dompet, bank, dan e-wallet — pisahkan akun transaksi harian dari tabungan</p></div>
     <div style="display:flex;gap:8px">
       <button class="btn btn-sm" onclick="openTransferModal()"><i class="fa-solid fa-right-left"></i> Transfer</button>
       <button class="btn btn-primary btn-sm" onclick="openAccModal()"><i class="fa-solid fa-plus"></i> Tambah Akun</button>
@@ -2528,12 +2681,19 @@ function rAcc(el) {
   <div class="grid-auto">${S.accounts.map(a => {
     const b = accBal(a.id);
     const tl = a.type==='cash'?'Tunai':a.type==='bank'?'Bank':'E-Wallet';
+    const purpose = a.purpose || 'transaksi';
+    const purposeLabel = { transaksi:'Transaksi Harian', tabungan:'Tabungan', lainnya:'Lainnya' }[purpose];
+    const purposeColor = purpose==='tabungan' ? 'var(--income)' : purpose==='transaksi' ? 'var(--acc)' : 'var(--txm)';
     return `<div class="card" style="position:relative;overflow:hidden">
       <div style="position:absolute;top:-20px;right:-20px;width:80px;height:80px;border-radius:50%;background:${a.color}0a"></div>
       <div style="display:flex;justify-content:space-between;align-items:start;position:relative;z-index:1">
         <div style="display:flex;align-items:center;gap:12px">
           <div style="width:46px;height:46px;border-radius:13px;background:${a.color}18;color:${a.color};display:flex;align-items:center;justify-content:center;font-size:19px;box-shadow:var(--neu-pressed-sm)"><i class="fa-solid ${a.icon}"></i></div>
-          <div><div style="font-weight:700;font-size:15px">${esc(a.name)}</div><div style="font-size:11px;color:var(--txm)">${tl}</div></div>
+          <div>
+            <div style="font-weight:700;font-size:15px">${esc(a.name)}</div>
+            <div style="font-size:11px;color:var(--txm)">${tl}${a.bankName?' · '+esc(a.bankName):''}</div>
+            ${a.accountNumber?`<div style="font-size:10.5px;color:var(--txm);font-family:monospace">${esc(a.accountNumber)}</div>`:''}
+          </div>
         </div>
         <div style="display:flex;gap:4px">
           <button class="btn-icon" style="width:27px;height:27px" onclick="openAccModal('${a.id}')"><i class="fa-solid fa-pen" style="font-size:9px"></i></button>
@@ -2541,6 +2701,7 @@ function rAcc(el) {
         </div>
       </div>
       <div style="margin-top:14px;font-family:'Outfit';font-size:24px;font-weight:800;color:${b>=0?'var(--income)':'var(--expense)'};position:relative;z-index:1">${fmt(b)}</div>
+      <div style="margin-top:8px;position:relative;z-index:1"><span class="badge" style="background:${purposeColor}18;color:${purposeColor}"><i class="fa-solid ${purpose==='tabungan'?'fa-piggy-bank':purpose==='transaksi'?'fa-cart-shopping':'fa-tag'}" style="font-size:9px"></i> ${purposeLabel}</span></div>
     </div>`;
   }).join('')}</div>`;
 }
@@ -2552,14 +2713,32 @@ let _accColor = '#4ADE80';
 window.openAccModal = function(editId) {
   const a = editId ? S.accounts.find(x=>x.id===editId) : null;
   _accColor = a ? a.color : ACC_COLORS[0];
+  const purpose = a ? (a.purpose||'transaksi') : 'transaksi';
   openModal(`
   <div class="modal-header"><h3>${a?'Edit':'Tambah'} Akun</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
   <div class="modal-body">
-    <div class="form-group"><label class="form-label">Nama Akun</label><input type="text" class="form-input" id="af-name" placeholder="Contoh: Bank Mandiri" value="${esc(a?a.name:'')}" maxlength="40"></div>
+    <div class="form-group"><label class="form-label">Nama Akun</label><input type="text" class="form-input" id="af-name" placeholder="Contoh: BCA Harian / BCA Tabungan" value="${esc(a?a.name:'')}" maxlength="40"></div>
     <div class="form-group"><label class="form-label">Tipe</label><select class="form-input" id="af-icon">${ACC_ICONS.map(([ic,lb])=>`<option value="${ic}"${a&&a.icon===ic?' selected':''}>${lb}</option>`).join('')}</select></div>
+    <div class="form-group"><label class="form-label">Dipakai untuk apa?</label>
+      <div class="type-toggle" id="af-purpose-tog">
+        <button class="${purpose==='transaksi'?'sel-active':''}" data-p="transaksi">Transaksi Harian</button>
+        <button class="${purpose==='tabungan'?'sel-active':''}" data-p="tabungan">Tabungan</button>
+        <button class="${purpose==='lainnya'?'sel-active':''}" data-p="lainnya">Lainnya</button>
+      </div>
+      <p style="font-size:10.5px;color:var(--txm);margin-top:6px">Penting kalau Anda punya 2 akun bank yang sama (mis. BCA untuk transaksi & BCA lain khusus nabung) — supaya tidak tertukar, terutama utk Tangga Kekayaan Abadi.</p>
+    </div>
+    <div class="grid-2">
+      <div class="form-group"><label class="form-label">Nama Bank/E-Wallet <span style="font-weight:400;color:var(--txm)">(opsional)</span></label><input type="text" class="form-input" id="af-bankname" placeholder="Contoh: BCA / DANA" value="${esc(a?a.bankName||'':'')}" maxlength="30"></div>
+      <div class="form-group"><label class="form-label">No. Rekening/ATM/HP <span style="font-weight:400;color:var(--txm)">(opsional)</span></label><input type="text" class="form-input" id="af-accnum" placeholder="Contoh: 1234567890" value="${esc(a?a.accountNumber||'':'')}" maxlength="30"></div>
+    </div>
     <div class="form-group"><label class="form-label">Warna</label><div style="display:flex;gap:7px;flex-wrap:wrap" id="af-colors">${ACC_COLORS.map(cl=>`<div style="width:30px;height:30px;border-radius:8px;background:${cl};cursor:pointer;border:3px solid ${_accColor===cl?'white':'transparent'};transition:all .15s;box-shadow:var(--neu-raised-sm)" onclick="pickAccC(this,'${cl}')"></div>`).join('')}</div></div>
   </div>
   <div class="modal-footer"><button class="btn" onclick="closeModal()">Batal</button><button class="btn btn-primary" id="af-save-btn" onclick="saveAcc('${editId||''}')">${a?'Simpan':'Tambah'}</button></div>`);
+  let _accPurpose = purpose;
+  document.querySelectorAll('#af-purpose-tog button').forEach(btn => {
+    btn.onclick = () => { _accPurpose = btn.dataset.p; document.querySelectorAll('#af-purpose-tog button').forEach(b=>b.className=''); btn.className='sel-active'; };
+  });
+  window._accPurposeGetter = () => _accPurpose;
 };
 window.pickAccC = function(el, cl) {
   _accColor = cl;
@@ -2570,25 +2749,55 @@ window.saveAcc = async function(editId) {
   const name = document.getElementById('af-name').value.trim();
   const icon = document.getElementById('af-icon').value;
   const type = icon==='fa-money-bill-wave'?'cash':icon==='fa-building-columns'?'bank':'ewallet';
+  const purpose = window._accPurposeGetter ? window._accPurposeGetter() : 'transaksi';
+  const bankName = document.getElementById('af-bankname').value.trim();
+  const accountNumber = document.getElementById('af-accnum').value.trim();
   if (!name) { toast('Nama akun harus diisi','error'); return; }
   const btn = document.getElementById('af-save-btn');
   if (btn) { btn.disabled=true; btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i>'; }
-  try { await fbSaveAcc({name,icon,color:_accColor,type}, editId||null); toast(editId?'Akun diperbarui':'Akun ditambahkan'); closeModal(); renderPage(); }
+  try { await fbSaveAcc({name,icon,color:_accColor,type,purpose,bankName,accountNumber}, editId||null); toast(editId?'Akun diperbarui':'Akun ditambahkan'); closeModal(); renderPage(); }
   catch(e) { toast('Gagal: '+e.message,'error'); if(btn){btn.disabled=false;btn.textContent=editId?'Simpan':'Tambah';} }
 };
 window.delAcc = function(id) {
   if (S.accounts.length <= 1) { toast('Minimal harus ada 1 akun','error'); return; }
   if (S.transactions.some(t => t.accountId === id)) { toast('Tidak bisa menghapus akun yang memiliki transaksi','error'); return; }
-  confirmDel('Hapus akun ini?', async () => { try { await fbDelAcc(id); toast('Akun dihapus','info'); renderPage(); } catch(e) { toast('Gagal','error'); } });
+  confirmDel('Hapus akun ini?', async () => {
+    try {
+      await fbDelAcc(id);
+      if (S.settings.wealthLadder?.savingsAccountId === id) {
+        S.settings.wealthLadder = { ...S.settings.wealthLadder, savingsAccountId:null };
+        await saveSettings();
+      }
+      toast('Akun dihapus','info'); renderPage();
+    } catch(e) { toast('Gagal','error'); }
+  });
 };
 
 /* ── TANGGA KEKAYAAN ABADI: aktivasi/nonaktivasi ── */
 window.openLadderActivationModal = function() {
   const hutangDebts = S.debts.filter(d => d.type==='hutang');
+  const savingsAccs = S.accounts.filter(a => (a.purpose||'transaksi')==='tabungan');
+  const otherAccs = S.accounts.filter(a => (a.purpose||'transaksi')!=='tabungan');
   openModal(`
   <div class="modal-header"><h3><i class="fa-solid fa-crown" style="color:var(--gold);margin-right:6px"></i>Aktifkan Template Kekayaan Abadi</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
   <div class="modal-body">
     <p style="font-size:12.5px;color:var(--tx2);margin-bottom:16px">Ini akan menambahkan <b>7 target tangga</b> ke halaman <b>Impian & Tabungan</b>. Progres setiap tangga dihitung otomatis dari data Anda yang sebenarnya (saldo, hutang, transaksi) — bukan yang bisa Anda tandai selesai sendiri.</p>
+
+    <div style="padding:12px;border-radius:10px;background:var(--bg2);border:1px solid var(--border);margin-bottom:14px">
+      <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:var(--tx2);cursor:pointer;margin-bottom:8px">
+        <input type="checkbox" id="wl-hassavings" style="width:16px;height:16px" ${savingsAccs.length?'checked':''} onchange="document.getElementById('wl-savings-sel').style.display=this.checked?'':'none'">
+        Untuk saat ini, apakah Anda punya akun tabungan terpisah?
+      </label>
+      <div id="wl-savings-sel" style="display:${savingsAccs.length?'':'none'}">
+        <select class="form-input" id="wl-savingsacc">
+          ${savingsAccs.length?`<optgroup label="Akun bertanda Tabungan">${savingsAccs.map(a=>`<option value="${a.id}">${esc(a.name)}${a.bankName?' — '+esc(a.bankName):''}</option>`).join('')}</optgroup>`:''}
+          ${otherAccs.length?`<optgroup label="Akun lain">${otherAccs.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</optgroup>`:''}
+        </select>
+        <p style="font-size:10.5px;color:var(--txm);margin-top:6px">Nabung Cash 10 Juta akan dihitung dari SALDO AKUN INI SAJA — bukan total semua akun — supaya gajian yang lewat untuk transaksi harian tidak ikut kehitung sbg tabungan.</p>
+      </div>
+      <p id="wl-noacc-note" style="font-size:10.5px;color:var(--txm);${savingsAccs.length?'display:none':''}">Kalau belum ada / dilewati, tangga 1 akan minta Anda menghubungkan akun nanti (bisa kapan saja lewat halaman ini).</p>
+    </div>
+
     <div class="form-group"><label class="form-label">Target Dana Pendidikan Anak (tangga 5) <span style="font-weight:400;color:var(--txm)">(bisa diubah nanti)</span></label><input type="text" class="form-input" id="wl-edu" placeholder="Contoh: 50.000.000" inputmode="numeric" oninput="liveFormatAmount(this)"></div>
     <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--tx2);cursor:pointer;margin-bottom:8px">
       <input type="checkbox" id="wl-haskpr" style="width:16px;height:16px" onchange="document.getElementById('wl-kpr-sel').style.display=this.checked?'':'none'">
@@ -2608,26 +2817,54 @@ window.confirmActivateLadder = function() {
   const eduTarget = parseAmount(document.getElementById('wl-edu').value) || 0;
   const hasKPR = document.getElementById('wl-haskpr').checked;
   const kprDebtId = hasKPR ? (document.getElementById('wl-kprdebt').value || null) : null;
+  const hasSavings = document.getElementById('wl-hassavings').checked;
+  const savingsAccountId = hasSavings ? (document.getElementById('wl-savingsacc').value || null) : null;
   closeModal();
   confirmAction(
     'Fitur ini akan melacak progres Anda secara otomatis dan tidak bisa ditandai selesai secara manual. Aktifkan Template Kekayaan Abadi sekarang?',
-    async () => { await activateWealthLadder(eduTarget, hasKPR, kprDebtId); },
+    async () => { await activateWealthLadder(eduTarget, hasKPR, kprDebtId, savingsAccountId); },
     { icon:'fa-crown', title:'Konfirmasi Aktivasi', okLabel:'Ya, Aktifkan' }
   );
 };
-async function activateWealthLadder(eduTarget, hasKPR, kprDebtId) {
+async function activateWealthLadder(eduTarget, hasKPR, kprDebtId, savingsAccountId) {
   try {
     for (const m of LADDER_META) {
       const data = { name:`Tangga ${m.step}: ${m.title}`, icon:m.icon, color:m.color, ladderStep:m.step, autoTrack:true,
         target: m.step===1?10000000:(m.step===5?eduTarget:0), current:0, deadline:'' };
       await fbSaveGoal(data, null);
     }
-    S.settings.wealthLadder = { enabled:true, hasKPR, kprDebtId, activatedAt: today() };
+    S.settings.wealthLadder = { enabled:true, hasKPR, kprDebtId, savingsAccountId, activatedAt: today() };
     await saveSettings();
     toast('Template Kekayaan Abadi diaktifkan! 🎉','success');
     nav('goals');
   } catch(e) { toast('Gagal mengaktifkan: '+e.message,'error'); }
 }
+// Hubungkan/ganti akun tabungan kapan saja — dipakai baik saat aktivasi maupun belakangan dari tangga 1
+window.openConnectSavingsAccModal = function() {
+  const savingsAccs = S.accounts.filter(a => (a.purpose||'transaksi')==='tabungan');
+  const otherAccs = S.accounts.filter(a => (a.purpose||'transaksi')!=='tabungan');
+  if (!S.accounts.length) { toast('Belum ada akun sama sekali. Buat akun dulu di halaman Akun.','error'); return; }
+  openModal(`
+  <div class="modal-header"><h3>Hubungkan Akun Tabungan</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
+  <div class="modal-body">
+    <div class="form-group"><label class="form-label">Pilih Akun</label>
+      <select class="form-input" id="cs-acc">
+        ${savingsAccs.length?`<optgroup label="Akun bertanda Tabungan">${savingsAccs.map(a=>`<option value="${a.id}">${esc(a.name)}${a.bankName?' — '+esc(a.bankName):''}</option>`).join('')}</optgroup>`:''}
+        ${otherAccs.length?`<optgroup label="Akun lain">${otherAccs.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</optgroup>`:''}
+      </select>
+    </div>
+    <p style="font-size:10.5px;color:var(--txm)">Tips: tandai akun ini sbg "Tabungan" di halaman Akun supaya tidak tertukar dengan akun transaksi harian.</p>
+  </div>
+  <div class="modal-footer"><button class="btn" onclick="closeModal()">Batal</button><button class="btn btn-primary" onclick="saveConnectSavingsAcc()">Hubungkan</button></div>`);
+};
+window.saveConnectSavingsAcc = async function() {
+  const accId = document.getElementById('cs-acc').value;
+  try {
+    S.settings.wealthLadder = { ...(S.settings.wealthLadder||{}), savingsAccountId: accId };
+    await saveSettings();
+    toast('Akun tabungan terhubung'); closeModal(); renderPage();
+  } catch(e) { toast('Gagal: '+e.message,'error'); }
+};
 window.deactivateWealthLadder = function() {
   confirmDel('Nonaktifkan Template Kekayaan Abadi? Semua 7 target tangga akan dihapus dari Impian & Tabungan (tabungan Dana Darurat/Pendidikan yang sudah terkumpul juga ikut hilang).', async () => {
     try {
@@ -2656,6 +2893,7 @@ window.recheckLadderStep = function(goalId) {
     ${p.needsCategory?`<button class="btn btn-primary btn-sm" style="margin-top:10px" onclick="closeModal();quickCreateInvestCategory()">Buat Kategori "Investasi" Sekarang</button>`:''}
     ${p.needsKpr?`<button class="btn btn-primary btn-sm" style="margin-top:10px" onclick="closeModal();nav('debts')">Ke Halaman Hutang</button>`:''}
     ${p.needsTarget?`<button class="btn btn-primary btn-sm" style="margin-top:10px" onclick="closeModal();openGoalModal('${g.id}')">Set Target Sekarang</button>`:''}
+    ${p.needsAccount?`<button class="btn btn-primary btn-sm" style="margin-top:10px" onclick="closeModal();openConnectSavingsAccModal()">Hubungkan Akun Tabungan</button>`:''}
   </div>
   <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal();renderPage()">Tutup</button></div>`);
 };
@@ -2808,7 +3046,7 @@ const TARGET_TABS = [
 function rTargets(el) {
   el.innerHTML = `
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px">
-    <div><h3 style="font-size:17px;font-weight:700">Target Berkala</h3><p style="font-size:12.5px;color:var(--tx2);margin-top:3px">Harian, mingguan, bulanan, tahunan — evaluasi berjenjang otomatis</p></div>
+    <div><h3 style="font-size:17px;font-weight:700">Target Berkala</h3><p style="font-size:12.5px;color:var(--tx2);margin-top:3px">Klik tanggal/minggu/bulan/tahun untuk lihat & isi target periode itu</p></div>
     <div style="display:flex;gap:8px">
       <button class="btn btn-sm" onclick="openBulkChecklistModal()"><i class="fa-solid fa-list-ul"></i> Tambah Banyak</button>
       <button class="btn btn-primary btn-sm" onclick="openTargetModal()"><i class="fa-solid fa-plus"></i> Tambah Target</button>
@@ -2817,121 +3055,231 @@ function rTargets(el) {
   <div class="type-toggle" id="target-tabs" style="max-width:520px;margin-bottom:18px">
     ${TARGET_TABS.map(t=>`<button class="${_targetTab===t.id?'sel-active':''}" data-tab="${t.id}"><i class="fa-solid ${t.icon}" style="margin-right:5px;font-size:10px"></i>${t.label}</button>`).join('')}
   </div>
-  <div id="target-rekap" style="margin-bottom:16px"></div>
   <div class="grid-auto" id="target-grid"></div>`;
 
   document.querySelectorAll('#target-tabs button').forEach(b => {
     b.onclick = () => { _targetTab = b.dataset.tab; renderPage(); };
   });
-  fillTargetRekap();
   fillTargetGrid();
 }
 
-function fillTargetRekap() {
-  const wrap = document.getElementById('target-rekap'); if (!wrap) return;
-  const n = new Date();
-  if (_targetTab === 'bulanan') {
-    const r = rekapMingguanUntukBulan(n.getFullYear(), n.getMonth()+1);
-    wrap.innerHTML = r ? `<div class="card" style="background:var(--acc-l);border-color:transparent">
-      <div style="display:flex;align-items:center;gap:10px">
-        <i class="fa-solid fa-layer-group" style="color:var(--acc)"></i>
-        <div><b>Rekap Mingguan → Bulan Ini:</b> ${r.done}/${r.total} target mingguan tercapai (${MO_FULL[n.getMonth()]})</div>
-      </div></div>` : '';
-  } else if (_targetTab === 'tahunan') {
-    const r = rekapBulananUntukTahun(n.getFullYear());
-    wrap.innerHTML = r ? `<div class="card" style="background:var(--acc-l);border-color:transparent">
-      <div style="display:flex;align-items:center;gap:10px">
-        <i class="fa-solid fa-layer-group" style="color:var(--acc)"></i>
-        <div><b>Rekap Bulanan → Tahun Ini:</b> ${r.done}/${r.total} target bulanan tercapai (${n.getFullYear()})</div>
-      </div></div>` : '';
-  } else {
-    wrap.innerHTML = '';
-  }
+function fillTargetGrid() {
+  if (_targetTab === 'harian')   return fillTargetHarian();
+  if (_targetTab === 'mingguan') return fillTargetMingguan();
+  if (_targetTab === 'bulanan')  return fillTargetBulanan();
+  return fillTargetTahunan();
 }
 
-function fillTargetGrid() {
+/* ── HARIAN: pilih tanggal spesifik (Senin–Minggu per minggu), jadwal & target dievaluasi utk tanggal itu ── */
+function fillTargetHarian() {
   const grid = document.getElementById('target-grid'); if (!grid) return;
-  const list = S.targets.filter(t => t.period === _targetTab);
-  if (!list.length) {
-    grid.innerHTML = `<div class="card empty-state" style="grid-column:1/-1"><i class="fa-solid fa-list-check"></i><p>Belum ada target ${_targetTab}. Bisa Nominal (otomatis sinkron transaksi), Checklist (kebiasaan), atau Jadwal Harian (jam per jam).</p></div>`;
-    return;
-  }
-  const pKey = currentPeriodKey(_targetTab);
+  const wsMon = weekStartOf(_targetHarianDate);
+  const days = []; for (let i=0;i<7;i++){ const d=new Date(wsMon+'T00:00:00'); d.setDate(d.getDate()+i); days.push(localDateStr(d)); }
+  const DOWSHORT = ['Sen','Sel','Rab','Kam','Jum','Sab','Min'];
+  const monthLabel = new Date(_targetHarianDate+'T00:00:00').toLocaleDateString('id-ID',{month:'long',year:'numeric'});
 
-  // Mode Jadwal ditampilkan penuh 1 kolom (timeline), sisanya di grid biasa
+  const nav = `
+    <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:12px">
+      <button class="btn-icon" onclick="targetHarianShiftWeek(-1)"><i class="fa-solid fa-chevron-left"></i></button>
+      <b style="font-family:'Outfit'">${monthLabel}</b>
+      <button class="btn-icon" onclick="targetHarianShiftWeek(1)"><i class="fa-solid fa-chevron-right"></i></button>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-bottom:16px">
+      ${days.map((d,i)=>{
+        const isSel = d === _targetHarianDate;
+        const isToday = d === today();
+        const dnum = new Date(d+'T00:00:00').getDate();
+        return `<div onclick="targetHarianSelectDate('${d}')" style="text-align:center;padding:10px 4px;border-radius:10px;cursor:pointer;background:${isSel?'var(--acc)':'var(--bg)'};color:${isSel?'#fff':'var(--tx)'};border:1px solid ${isToday&&!isSel?'var(--acc)':'var(--border)'};box-shadow:var(--neu-raised-sm)">
+          <div style="font-size:10px;font-weight:700;opacity:.8">${DOWSHORT[i]}</div>
+          <div style="font-size:15px;font-weight:800;margin-top:3px">${dnum}</div>
+        </div>`;
+      }).join('')}
+    </div>`;
+
+  const dateStr = _targetHarianDate;
+  const dateLabel = new Date(dateStr+'T00:00:00').toLocaleDateString('id-ID',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
+  const list = S.targets.filter(t => t.period === 'harian');
   const jadwalList = list.filter(t=>t.mode==='jadwal');
   const others = list.filter(t=>t.mode!=='jadwal');
 
-  grid.innerHTML =
-    jadwalList.map(t => renderJadwalCard(t)).join('') +
-    others.map(t => {
-    if (t.mode === 'nominal') {
-      const p = targetProgress(t);
-      const achieved = t.basis==='kategori' ? p.actual>=p.target : (t.goalType === 'hemat' ? p.actual >= p.target : p.actual <= p.target);
-      const color = achieved ? 'var(--income)' : (p.pct>=80 ? 'var(--gold)' : 'var(--acc)');
-      return `<div class="card">
-        <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px">
-          <div>
-            <div style="font-weight:700;font-size:14px">${esc(t.title)}</div>
-            <div style="font-size:11px;color:var(--txm)">${t.basis==='kategori'?`% dari kategori "${esc(catObj(t.incomeCatId).name)}" → "${esc(catObj(t.expenseCatId).name)}"`:(t.goalType==='hemat'?'Target hemat (pemasukan − pengeluaran)':'Batas maksimal pengeluaran')} · Otomatis dari transaksi</div>
-          </div>
-          <div style="display:flex;gap:4px">
-            <button class="btn-icon" style="width:27px;height:27px" onclick="openTargetModal('${t.id}')"><i class="fa-solid fa-pen" style="font-size:9px"></i></button>
-            <button class="btn-icon" style="width:27px;height:27px;color:var(--expense)" onclick="delTarget('${t.id}')"><i class="fa-solid fa-trash" style="font-size:9px"></i></button>
-          </div>
-        </div>
-        <div class="progress-bar"><div class="progress-fill" style="width:${p.pct}%;background:${color}"></div></div>
-        <div style="display:flex;justify-content:space-between;margin-top:7px;font-size:12.5px">
-          <span style="color:${color};font-weight:600">${p.isPercent?p.actual+'%':fmt(p.actual)}</span>
-          <span style="color:var(--txm)">target ${p.isPercent?p.target+'%':fmt(p.target)}</span>
-        </div>
-        ${achieved?`<div style="margin-top:8px"><span class="badge" style="background:var(--income-l);color:var(--income)"><i class="fa-solid fa-check"></i> Tercapai</span></div>`:''}
-      </div>`;
-    } else {
-      const done = (t.completedPeriods||[]).includes(pKey);
-      return `<div class="card">
-        <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:8px">
-          <div>
-            <div style="font-weight:700;font-size:14px">${esc(t.title)}</div>
-            ${t.description?`<div style="font-size:11.5px;color:var(--tx2);margin-top:3px">${esc(t.description)}</div>`:''}
-          </div>
-          <div style="display:flex;gap:4px">
-            <button class="btn-icon" style="width:27px;height:27px" onclick="openTargetModal('${t.id}')"><i class="fa-solid fa-pen" style="font-size:9px"></i></button>
-            <button class="btn-icon" style="width:27px;height:27px;color:var(--expense)" onclick="delTarget('${t.id}')"><i class="fa-solid fa-trash" style="font-size:9px"></i></button>
-          </div>
-        </div>
-        <button class="btn ${done?'btn-primary':''} btn-sm" style="width:100%;justify-content:center" onclick="toggleTargetDone('${t.id}')">
-          <i class="fa-solid ${done?'fa-check-circle':'fa-circle'}"></i> ${done?'Selesai periode ini':'Tandai Selesai'}
-        </button>
-      </div>`;
-    }
-  }).join('');
+  grid.innerHTML = `<div style="grid-column:1/-1">${nav}
+    <div style="font-weight:700;font-size:13px;color:var(--tx2);margin-bottom:10px">${dateStr===today()?'📍 Hari Ini — ':''}${dateLabel}</div>
+  </div>` +
+    (!list.length ? `<div class="card empty-state" style="grid-column:1/-1"><i class="fa-solid fa-list-check"></i><p>Belum ada target harian. Bisa Nominal, Checklist, atau Jadwal (jam per jam — bisa disetel beda tiap hari kalau perlu).</p></div>` :
+    jadwalList.map(t => renderJadwalCardForDate(t, dateStr)).join('') + others.map(t => renderTargetCardForKey(t, dateStr)).join(''));
 }
+window.targetHarianShiftWeek = function(dir) {
+  const d = new Date(_targetHarianDate+'T00:00:00'); d.setDate(d.getDate()+dir*7);
+  _targetHarianDate = localDateStr(d); fillTargetHarian();
+};
+window.targetHarianSelectDate = function(d) { _targetHarianDate = d; fillTargetHarian(); };
 
-// ── Kartu mode Jadwal — timeline hari ini (otomatis pilih varian Senin-Jumat/Sabtu/Minggu) ──
-function renderJadwalCard(t) {
-  const variant = todayVariantKey();
-  const variantLabel = { weekday:'Senin–Jumat', saturday:'Sabtu', sunday:'Minggu' }[variant];
-  const blocks = scheduleBlocksFor(t, variant);
-  const dateStr = today();
-  const doneList = (t.completedBlocks && t.completedBlocks[dateStr]) || [];
-  const doneCount = blocks.filter((b,i)=>doneList.includes(i)).length;
-  return `<div class="card" style="grid-column:1/-1">
-    <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px">
+/* ── MINGGUAN: pilih bulan dulu, lalu pilih salah satu dari ~4-5 minggu di bulan itu ── */
+function fillTargetMingguan() {
+  const grid = document.getElementById('target-grid'); if (!grid) return;
+  const { y, m } = _targetMingguMonth;
+  const weeks = weeksInMonth(y, m);
+  const nav = `
+    <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:14px">
+      <button class="btn-icon" onclick="targetMingguShiftMonth(-1)"><i class="fa-solid fa-chevron-left"></i></button>
+      <b style="font-family:'Outfit'">${MO_FULL[m-1]} ${y}</b>
+      <button class="btn-icon" onclick="targetMingguShiftMonth(1)"><i class="fa-solid fa-chevron-right"></i></button>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:18px">
+      ${weeks.map((wk,i) => {
+        const end = new Date(wk+'T00:00:00'); end.setDate(end.getDate()+6);
+        const isSel = wk === _targetMingguKey;
+        return `<button class="btn ${isSel?'btn-primary':''} btn-sm" onclick="targetMingguSelectWeek('${wk}')">Minggu ${i+1}: ${new Date(wk+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short'})}–${end.toLocaleDateString('id-ID',{day:'numeric',month:'short'})}</button>`;
+      }).join('')}
+    </div>`;
+
+  const list = S.targets.filter(t => t.period === 'mingguan');
+  const pKey = _targetMingguKey;
+  grid.innerHTML = `<div style="grid-column:1/-1">${nav}</div>` +
+    (!list.length ? `<div class="card empty-state" style="grid-column:1/-1"><i class="fa-solid fa-list-check"></i><p>Belum ada target mingguan. Contoh: "Gym 1x/minggu", "Invest 20% dari income Ngojol".</p></div>` :
+    list.map(t => renderTargetCardForKey(t, pKey)).join(''));
+}
+window.targetMingguShiftMonth = function(dir) {
+  let { y, m } = _targetMingguMonth; m += dir; if (m<1){m=12;y--;} if(m>12){m=1;y++;}
+  _targetMingguMonth = { y, m };
+  _targetMingguKey = weeksInMonth(y,m)[0];
+  fillTargetMingguan();
+};
+window.targetMingguSelectWeek = function(wk) { _targetMingguKey = wk; fillTargetMingguan(); };
+
+/* ── BULANAN: pilih tahun dulu, lalu salah satu dari 12 bulan — plus rekap mingguan bulan itu ── */
+function fillTargetBulanan() {
+  const grid = document.getElementById('target-grid'); if (!grid) return;
+  const y = _targetBulanYear;
+  const nav = `
+    <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:14px">
+      <button class="btn-icon" onclick="targetBulanShiftYear(-1)"><i class="fa-solid fa-chevron-left"></i></button>
+      <b style="font-family:'Outfit'">${y}</b>
+      <button class="btn-icon" onclick="targetBulanShiftYear(1)"><i class="fa-solid fa-chevron-right"></i></button>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px">
+      ${MO_FULL.map((label,i)=>{
+        const mk = `${y}-${String(i+1).padStart(2,'0')}`;
+        const isSel = mk === _targetBulanKey;
+        return `<button class="btn ${isSel?'btn-primary':''} btn-sm" style="justify-content:center" onclick="targetBulanSelectMonth('${mk}')">${MO[i]}</button>`;
+      }).join('')}
+    </div>`;
+  const [selY, selM] = _targetBulanKey.split('-').map(Number);
+  const rekap = rekapMingguanUntukBulan(selY, selM);
+  const rekapHtml = rekap ? `<div class="card" style="grid-column:1/-1;background:var(--acc-l);border-color:transparent;margin-bottom:14px">
+    <div style="display:flex;align-items:center;gap:10px"><i class="fa-solid fa-layer-group" style="color:var(--acc)"></i>
+    <div><b>Rekap Mingguan:</b> ${rekap.done}/${rekap.total} target mingguan tercapai di ${MO_FULL[selM-1]} ${selY}</div></div></div>` : '';
+
+  const list = S.targets.filter(t => t.period === 'bulanan');
+  grid.innerHTML = `<div style="grid-column:1/-1">${nav}</div>${rekapHtml}` +
+    (!list.length ? `<div class="card empty-state" style="grid-column:1/-1"><i class="fa-solid fa-list-check"></i><p>Belum ada target bulanan. Contoh: "Income 3jt kotor".</p></div>` :
+    list.map(t => renderTargetCardForKey(t, _targetBulanKey)).join(''));
+}
+window.targetBulanShiftYear = function(dir) {
+  _targetBulanYear += dir; _targetBulanKey = `${_targetBulanYear}-${_targetBulanKey.split('-')[1]}`; fillTargetBulanan();
+};
+window.targetBulanSelectMonth = function(mk) { _targetBulanKey = mk; fillTargetBulanan(); };
+
+/* ── TAHUNAN: pilih tahun — evaluasi apa saja yang tercapai tahun itu, plus rekap bulanan ── */
+function fillTargetTahunan() {
+  const grid = document.getElementById('target-grid'); if (!grid) return;
+  const y = _targetTahunYear;
+  const nav = `
+    <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:14px">
+      <button class="btn-icon" onclick="targetTahunShift(-1)"><i class="fa-solid fa-chevron-left"></i></button>
+      <b style="font-family:'Outfit';font-size:20px">${y}</b>
+      <button class="btn-icon" onclick="targetTahunShift(1)"><i class="fa-solid fa-chevron-right"></i></button>
+    </div>`;
+  const rekap = rekapBulananUntukTahun(y);
+  const rekapHtml = rekap ? `<div class="card" style="grid-column:1/-1;background:var(--acc-l);border-color:transparent;margin-bottom:14px">
+    <div style="display:flex;align-items:center;gap:10px"><i class="fa-solid fa-layer-group" style="color:var(--acc)"></i>
+    <div><b>Rekap Bulanan:</b> ${rekap.done}/${rekap.total} target bulanan tercapai di tahun ${y}</div></div></div>` : '';
+
+  const list = S.targets.filter(t => t.period === 'tahunan');
+  grid.innerHTML = `<div style="grid-column:1/-1">${nav}</div>${rekapHtml}` +
+    (!list.length ? `<div class="card empty-state" style="grid-column:1/-1"><i class="fa-solid fa-list-check"></i><p>Belum ada target tahunan. Contoh: "Tercapai tabungan 10jt".</p></div>` :
+    list.map(t => renderTargetCardForKey(t, String(y))).join(''));
+}
+window.targetTahunShift = function(dir) { _targetTahunYear += dir; fillTargetTahunan(); };
+
+// ── Kartu generik Nominal/Checklist utk PERIODE MANAPUN (bukan cuma "sekarang") ──
+function renderTargetCardForKey(t, pKey) {
+  if (t.mode === 'nominal') {
+    const p = targetProgressForKey(t, pKey);
+    const achieved = t.basis==='kategori' ? p.actual>=p.target : (t.goalType === 'hemat' ? p.actual >= p.target : p.actual <= p.target);
+    const color = achieved ? 'var(--income)' : (p.pct>=80 ? 'var(--gold)' : 'var(--acc)');
+    return `<div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px">
+        <div>
+          <div style="font-weight:700;font-size:14px">${esc(t.title)}</div>
+          <div style="font-size:11px;color:var(--txm)">${t.basis==='kategori'?`% dari kategori "${esc(catObj(t.incomeCatId).name)}" → "${esc(catObj(t.expenseCatId).name)}"`:(t.goalType==='hemat'?'Target hemat (pemasukan − pengeluaran)':'Batas maksimal pengeluaran')} · Otomatis dari transaksi</div>
+        </div>
+        <div style="display:flex;gap:4px">
+          <button class="btn-icon" style="width:27px;height:27px" onclick="openTargetModal('${t.id}')"><i class="fa-solid fa-pen" style="font-size:9px"></i></button>
+          <button class="btn-icon" style="width:27px;height:27px;color:var(--expense)" onclick="delTarget('${t.id}')"><i class="fa-solid fa-trash" style="font-size:9px"></i></button>
+        </div>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" style="width:${p.pct}%;background:${color}"></div></div>
+      <div style="display:flex;justify-content:space-between;margin-top:7px;font-size:12.5px">
+        <span style="color:${color};font-weight:600">${p.isPercent?p.actual+'%':fmt(p.actual)}</span>
+        <span style="color:var(--txm)">target ${p.isPercent?p.target+'%':fmt(p.target)}</span>
+      </div>
+      ${achieved?`<div style="margin-top:8px"><span class="badge" style="background:var(--income-l);color:var(--income)"><i class="fa-solid fa-check"></i> Tercapai</span></div>`:''}
+    </div>`;
+  }
+  const done = (t.completedPeriods||[]).includes(pKey);
+  return `<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:8px">
       <div>
-        <div style="font-weight:700;font-size:14px"><i class="fa-solid fa-clock" style="color:${t.color||'var(--acc)'};margin-right:6px"></i>${esc(t.title)}</div>
-        <div style="font-size:11px;color:var(--txm)">Jadwal hari ini (${variantLabel}) · ${doneCount}/${blocks.length} selesai</div>
+        <div style="font-weight:700;font-size:14px">${esc(t.title)}</div>
+        ${t.description?`<div style="font-size:11.5px;color:var(--tx2);margin-top:3px">${esc(t.description)}</div>`:''}
       </div>
       <div style="display:flex;gap:4px">
         <button class="btn-icon" style="width:27px;height:27px" onclick="openTargetModal('${t.id}')"><i class="fa-solid fa-pen" style="font-size:9px"></i></button>
         <button class="btn-icon" style="width:27px;height:27px;color:var(--expense)" onclick="delTarget('${t.id}')"><i class="fa-solid fa-trash" style="font-size:9px"></i></button>
       </div>
     </div>
-    ${!blocks.length ? `<div class="empty-state" style="padding:14px"><p style="font-size:12px">Belum ada jadwal untuk hari ini (${variantLabel}). Klik edit untuk mengisi.</p></div>` :
+    <button class="btn ${done?'btn-primary':''} btn-sm" style="width:100%;justify-content:center" onclick="toggleTargetDoneForKey('${t.id}','${pKey}')">
+      <i class="fa-solid ${done?'fa-check-circle':'fa-circle'}"></i> ${done?'Selesai periode ini':'Tandai Selesai'}
+    </button>
+  </div>`;
+}
+
+// ── Kartu mode Jadwal utk TANGGAL SPESIFIK — pakai override kalau ada, kalau tidak pakai default hari itu ──
+function dayOfWeekVariant(dateStr) {
+  const day = new Date(dateStr+'T00:00:00').getDay(); // 0=Min..6=Sab
+  if (day === 6) return 'saturday';
+  if (day === 0) return 'sunday';
+  return 'weekday';
+}
+function scheduleBlocksForDate(t, dateStr) {
+  if (t.overrides && t.overrides[dateStr]) return t.overrides[dateStr];
+  return scheduleBlocksFor(t, dayOfWeekVariant(dateStr));
+}
+function renderJadwalCardForDate(t, dateStr) {
+  const variant = dayOfWeekVariant(dateStr);
+  const variantLabel = { weekday:'Senin–Jumat', saturday:'Sabtu', sunday:'Minggu' }[variant];
+  const hasOverride = !!(t.overrides && t.overrides[dateStr]);
+  const blocks = scheduleBlocksForDate(t, dateStr);
+  const doneList = (t.completedBlocks && t.completedBlocks[dateStr]) || [];
+  const doneCount = blocks.filter((b,i)=>doneList.includes(i)).length;
+  return `<div class="card" style="grid-column:1/-1">
+    <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px;flex-wrap:wrap;gap:8px">
+      <div>
+        <div style="font-weight:700;font-size:14px"><i class="fa-solid fa-clock" style="color:${t.color||'var(--acc)'};margin-right:6px"></i>${esc(t.title)}</div>
+        <div style="font-size:11px;color:var(--txm)">${hasOverride?'⚡ Jadwal khusus tanggal ini':'Jadwal default ('+variantLabel+')'} · ${doneCount}/${blocks.length} selesai</div>
+      </div>
+      <div style="display:flex;gap:4px">
+        <button class="btn btn-sm" onclick="openScheduleOverrideModal('${t.id}','${dateStr}')">${hasOverride?'Edit Jadwal Ini':'Jadwal Beda Hari Ini'}</button>
+        <button class="btn-icon" style="width:27px;height:27px" onclick="openTargetModal('${t.id}')"><i class="fa-solid fa-pen" style="font-size:9px"></i></button>
+        <button class="btn-icon" style="width:27px;height:27px;color:var(--expense)" onclick="delTarget('${t.id}')"><i class="fa-solid fa-trash" style="font-size:9px"></i></button>
+      </div>
+    </div>
+    ${!blocks.length ? `<div class="empty-state" style="padding:14px"><p style="font-size:12px">Belum ada jadwal untuk ${variantLabel}. Klik edit target untuk mengisi jadwal default.</p></div>` :
     `<div class="ladder-track">${blocks.map((b,i)=>{
       const done = doneList.includes(i);
       return `<div class="ladder-step${done?' done':''}">
-        <div class="ladder-step-num" style="background:${done?'var(--income)':'var(--bg)'};color:${done?'#fff':'var(--tx2)'};box-shadow:${done?'0 0 0 3px var(--income-l)':'var(--neu-raised-sm)'};font-size:9.5px;cursor:pointer" onclick="toggleScheduleBlock('${t.id}',${i})">${done?'<i class="fa-solid fa-check"></i>':i+1}</div>
+        <div class="ladder-step-num" style="background:${done?'var(--income)':'var(--bg)'};color:${done?'#fff':'var(--tx2)'};box-shadow:${done?'0 0 0 3px var(--income-l)':'var(--neu-raised-sm)'};font-size:9.5px;cursor:pointer" onclick="toggleScheduleBlock('${t.id}',${i},'${dateStr}')">${done?'<i class="fa-solid fa-check"></i>':i+1}</div>
         <div class="ladder-step-body">
           <div style="font-size:12.5px;${done?'text-decoration:line-through;color:var(--txm)':''}"><b>${b.start}–${b.end}</b> ${esc(b.activity)}</div>
         </div>
@@ -2939,14 +3287,39 @@ function renderJadwalCard(t) {
     }).join('')}</div>`}
   </div>`;
 }
-window.toggleScheduleBlock = async function(id, idx) {
+window.toggleScheduleBlock = async function(id, idx, dateStr) {
+  dateStr = dateStr || today();
   const t = S.targets.find(x=>x.id===id); if (!t) return;
-  const dateStr = today();
   const cb = { ...(t.completedBlocks||{}) };
   const list = new Set(cb[dateStr]||[]);
   if (list.has(idx)) list.delete(idx); else list.add(idx);
   cb[dateStr] = [...list];
   try { await fbSaveTarget({ completedBlocks: cb }, id); renderPage(); }
+  catch(e) { toast('Gagal: '+e.message,'error'); }
+};
+// Jadwal KHUSUS 1 tanggal — tidak mengubah jadwal default hari itu (utk jaga-jaga kalau rutinitas berubah dadakan)
+window.openScheduleOverrideModal = function(id, dateStr) {
+  const t = S.targets.find(x=>x.id===id); if (!t) return;
+  const existing = (t.overrides && t.overrides[dateStr]) || null;
+  const label = new Date(dateStr+'T00:00:00').toLocaleDateString('id-ID',{weekday:'long',day:'numeric',month:'long'});
+  openModal(`
+  <div class="modal-header"><h3>Jadwal Khusus — ${label}</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
+  <div class="modal-body">
+    <p style="font-size:11px;color:var(--txm);margin-bottom:8px">Isi jadwal KHUSUS untuk tanggal ini saja — tidak mengubah jadwal default hari biasa. Format: <code>05:00-07:00 Aktivitas</code>, satu baris per blok. Kosongkan lalu simpan untuk hapus override & balik ke jadwal default.</p>
+    <textarea class="form-input" id="so-text" rows="8">${scheduleToText(existing)}</textarea>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal()">Batal</button>
+    <button class="btn btn-primary" onclick="saveScheduleOverride('${id}','${dateStr}')">Simpan</button>
+  </div>`);
+};
+window.saveScheduleOverride = async function(id, dateStr) {
+  const t = S.targets.find(x=>x.id===id); if (!t) return;
+  const text = document.getElementById('so-text').value;
+  const blocks = parseScheduleText(text);
+  const overrides = { ...(t.overrides||{}) };
+  if (blocks.length) overrides[dateStr] = blocks; else delete overrides[dateStr];
+  try { await fbSaveTarget({ overrides }, id); toast('Jadwal khusus disimpan'); closeModal(); renderPage(); }
   catch(e) { toast('Gagal: '+e.message,'error'); }
 };
 
@@ -3084,7 +3457,10 @@ window.delTarget = function(id) {
 };
 window.toggleTargetDone = async function(id) {
   const t = S.targets.find(x=>x.id===id); if (!t) return;
-  const pKey = currentPeriodKey(t.period);
+  await toggleTargetDoneForKey(id, currentPeriodKey(t.period));
+};
+window.toggleTargetDoneForKey = async function(id, pKey) {
+  const t = S.targets.find(x=>x.id===id); if (!t) return;
   const list = new Set(t.completedPeriods || []);
   if (list.has(pKey)) list.delete(pKey); else list.add(pKey);
   try { await fbSaveTarget({ completedPeriods: [...list] }, id); renderPage(); }
@@ -3238,6 +3614,7 @@ function rSet(el) {
       <p style="font-size:12px;color:var(--tx2);margin-bottom:12px">7 tahap tangga kebebasan finansial (Nabung Cash → Bebas Hutang → Dana Darurat → Investasi 20% → Dana Pendidikan → Lunasi KPR → Kekayaan Abadi & Berbagi). Progresnya <b>otomatis dihitung dari data transaksi, hutang, dan tabungan Anda yang sebenarnya</b> — tidak bisa ditandai selesai secara manual.</p>
       ${S.settings.wealthLadder?.enabled ? `
         <button class="btn btn-sm" onclick="nav('goals')" style="margin-right:8px"><i class="fa-solid fa-stairs"></i> Lihat Progres</button>
+        <button class="btn btn-sm" onclick="openConnectSavingsAccModal()" style="margin-right:8px"><i class="fa-solid fa-piggy-bank"></i> ${S.settings.wealthLadder?.savingsAccountId?'Ganti':'Hubungkan'} Akun Tabungan</button>
         <button class="btn btn-sm btn-danger" onclick="deactivateWealthLadder()"><i class="fa-solid fa-power-off"></i> Nonaktifkan</button>
       ` : `
         <button class="btn btn-primary btn-sm" onclick="openLadderActivationModal()"><i class="fa-solid fa-crown"></i> Aktifkan Template</button>
