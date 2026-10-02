@@ -178,6 +178,33 @@ const CUR_LOCALE = {
   '¥':  { locale:'ja-JP', decimals:0 },
   '£':  { locale:'en-GB', decimals:2 }
 };
+// ── Kurs mata uang asing (Dashboard & Pengaturan) ──
+// Basis = mata uang yg dipilih user di Pengaturan (dianggap mewakili "negara asal"nya).
+const CUR_ISO = { 'Rp':'IDR', '$':'USD', '€':'EUR', '¥':'JPY', '£':'GBP' };
+const FX_MAJORS = ['USD','EUR','GBP','JPY','SGD','AUD','MYR','CNY'];
+let _fxCache = null;
+// Cache di localStorage 6 jam supaya hemat kuota API & tetap tampil (walau agak basi) kalau offline/API down.
+async function fetchFxRates(baseIso) {
+  const cacheKey = 'mm_fx_' + baseIso;
+  let cached = null;
+  try { cached = JSON.parse(localStorage.getItem(cacheKey) || 'null'); } catch(e) {}
+  if (cached && (Date.now() - cached.fetchedAt) < 6*3600*1000) { _fxCache = cached; return cached; }
+  try {
+    const symbols = FX_MAJORS.filter(c=>c!==baseIso).join(',');
+    const res = await fetch(`https://api.frankfurter.app/latest?from=${baseIso}&to=${symbols}`);
+    if (!res.ok) throw new Error('HTTP '+res.status);
+    const data = await res.json();
+    const rates = {};
+    Object.entries(data.rates||{}).forEach(([k,v]) => { if (v>0) rates[k] = 1/v; }); // invert: "1 IDR=0.00006 USD" → "1 USD=X IDR"
+    const result = { base: baseIso, rates, date: data.date, fetchedAt: Date.now() };
+    try { localStorage.setItem(cacheKey, JSON.stringify(result)); } catch(e) {}
+    _fxCache = result;
+    return result;
+  } catch(e) {
+    if (cached) { _fxCache = cached; return cached; } // stale tapi lebih baik drpd kosong
+    return null;
+  }
+}
 const fmt = n => {
   const cur = S.settings?.currency || 'Rp';
   const conf = CUR_LOCALE[cur] || CUR_LOCALE['Rp'];
@@ -722,6 +749,20 @@ window.doGoogleLogin = async function(btn) {
       'auth/cancelled-popup-request': 'Login dibatalkan.',
     };
     toast(msgs[e.code] || 'Google login gagal: ' + e.message, 'error');
+  }
+};
+// Ganti akun Google TANPA logout manual dulu — paksa Google munculkan pemilih akun.
+window.switchGoogleAccount = async function() {
+  try {
+    googleProvider.setCustomParameters({ prompt: 'select_account' });
+    await signInWithPopup(auth, googleProvider);
+    toast('Berhasil ganti akun 🎉', 'success');
+  } catch (e) {
+    const msgs = {
+      'auth/popup-closed-by-user': 'Dibatalkan.',
+      'auth/popup-blocked': 'Popup diblokir browser. Izinkan popup dan coba lagi.',
+    };
+    toast(msgs[e.code] || 'Gagal ganti akun: ' + e.message, 'error');
   }
 };
 
@@ -1514,6 +1555,48 @@ function rAIReport(el) {
   if (wrap) { wrap.id = 'ai-analysis-wrap'; renderAIAnalysis(); }
 }
 
+// Preview kurs ringkas di Pengaturan — pakai cache/mekanisme yg sama dgn Dashboard (satu sumber kebenaran).
+async function fillSettingsFxPreview() {
+  const wrap = document.getElementById('settings-fx-preview'); if (!wrap) return;
+  const homeIso = CUR_ISO[S.settings.currency || 'Rp'] || 'IDR';
+  wrap.innerHTML = `<div style="font-size:11.5px;color:var(--txm)"><i class="fa-solid fa-spinner fa-spin"></i> Memuat kurs terkini…</div>`;
+  const data = await fetchFxRates(homeIso);
+  if (!document.getElementById('settings-fx-preview')) return;
+  if (!data) { wrap.innerHTML = `<div style="font-size:11.5px;color:var(--txm)">Kurs belum bisa dimuat saat ini.</div>`; return; }
+  const sample = FX_MAJORS.find(c=>c!==homeIso && data.rates[c]);
+  if (!sample) { wrap.innerHTML = ''; return; }
+  wrap.innerHTML = `<div style="font-size:12px;color:var(--tx2)">Contoh kurs saat ini: <b>1 ${sample} = ${fmt(data.rates[sample])}</b> <span style="color:var(--txm);font-size:10.5px">(per ${esc(data.date||'-')})</span></div>
+    <div style="margin-top:4px"><a href="#" onclick="nav('dashboard');return false" style="color:var(--acc);font-size:11px">Lihat semua kurs di Dashboard →</a></div>`;
+}
+
+/* ── DASHBOARD ── */
+// Widget kurs: basis = mata uang pilihan user di Pengaturan. Async & aman gagal (tidak merusak dashboard).
+async function fillFxRatesWidget() {
+  const wrap = document.getElementById('fx-rates-wrap'); if (!wrap) return;
+  const homeIso = CUR_ISO[S.settings.currency || 'Rp'] || 'IDR';
+  wrap.innerHTML = `<div class="card"><div style="text-align:center;padding:10px;color:var(--txm);font-size:12px"><i class="fa-solid fa-spinner fa-spin"></i> Memuat kurs mata uang…</div></div>`;
+  const data = await fetchFxRates(homeIso);
+  if (!document.getElementById('fx-rates-wrap')) return; // user sudah pindah halaman
+  if (!data) {
+    wrap.innerHTML = `<div class="card"><div style="text-align:center;padding:10px;color:var(--txm);font-size:12px"><i class="fa-solid fa-wifi"></i> Kurs belum bisa dimuat (offline / layanan sedang sibuk). <a href="#" onclick="fillFxRatesWidget();return false" style="color:var(--acc)">Coba lagi</a></div></div>`;
+    return;
+  }
+  const majors = FX_MAJORS.filter(c => c !== homeIso && data.rates[c]);
+  const fresh = (Date.now() - data.fetchedAt) < 6*3600*1000;
+  wrap.innerHTML = `<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:6px">
+      <h4 style="font-size:14px"><i class="fa-solid fa-money-bill-transfer" style="color:var(--acc);margin-right:7px"></i>Kurs Mata Uang → ${homeIso}</h4>
+      <span style="font-size:10.5px;color:var(--txm)">${fresh?'':'⚠ data tersimpan · '}Per ${esc(data.date||'-')} · <a href="#" onclick="nav('settings');return false" style="color:var(--acc)">Ubah negara/mata uang</a></span>
+    </div>
+    <div class="fx-grid">
+      ${majors.map(c => `<div class="fx-item">
+        <div class="fx-code">1 ${c}</div>
+        <div class="fx-val">${fmt(data.rates[c])}</div>
+      </div>`).join('')}
+    </div>
+  </div>`;
+}
+
 /* ── DASHBOARD ── */
 function rDash(el) {
   const tm = filterReal(monthTxns(0)), lm = filterReal(monthTxns(1));
@@ -1571,6 +1654,7 @@ function rDash(el) {
   </div>
 
   <div id="ai-analysis-wrap" style="margin-bottom:20px"></div>
+  <div id="fx-rates-wrap" style="margin-bottom:20px"></div>
 
   <div class="grid-2-1" style="margin-bottom:20px">
     <div class="card"><h4 style="font-size:15px;margin-bottom:14px">Pemasukan vs Pengeluaran (6 Bulan)</h4><div class="chart-wrap" style="height:230px"><canvas id="ch-bar"></canvas></div></div>
@@ -1595,6 +1679,7 @@ function rDash(el) {
   </div>`;
 
   renderAIAnalysis();
+  fillFxRatesWidget(); // async, tidak memblokir render dashboard
   countUp('stat-bal', bal, v => fmt(v));
   countUp('stat-inc', inc, v => fmt(v));
   countUp('stat-exp', exp, v => fmt(v));
@@ -1828,7 +1913,7 @@ window.calDayClick = function(dateStr) {
       </div>
       <div class="modal-footer">
         <button class="btn" onclick="closeModal()">Tutup</button>
-        <button class="btn btn-primary" onclick="closeModal();openTxnModal()">
+        <button class="btn btn-primary" onclick="closeModal();openTxnModal(null,'${dateStr}')">
           <i class="fa-solid fa-plus"></i> Tambah Transaksi
         </button>
       </div>`);
@@ -1877,7 +1962,7 @@ window.calDayClick = function(dateStr) {
     <div class="modal-body">
 
       ${dueNotice}
-      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:18px">
+      <div class="cal-summary-chips3" style="display:grid;gap:8px;margin-bottom:18px">
         <div style="padding:10px;border-radius:10px;background:var(--income-l);border:1px solid rgba(61,219,160,0.2);text-align:center">
           <div style="font-size:9.5px;font-weight:700;color:var(--income);letter-spacing:.4px;text-transform:uppercase;margin-bottom:4px">
             <i class="fa-solid fa-arrow-down" style="margin-right:3px"></i>Pemasukan
@@ -1920,7 +2005,7 @@ window.calDayClick = function(dateStr) {
     </div>
     <div class="modal-footer">
       <button class="btn" onclick="closeModal()">Tutup</button>
-      <button class="btn btn-primary" onclick="closeModal();openTxnModal()">
+      <button class="btn btn-primary" onclick="closeModal();openTxnModal(null,'${dateStr}')">
         <i class="fa-solid fa-plus"></i> Tambah
       </button>
     </div>`);
@@ -1993,8 +2078,10 @@ function fillTxnTable() {
 }
 
 /* ── TXN MODAL ── */
-window.openTxnModal = function(editId) {
+window.openTxnModal = function(editId, presetDate) {
   const t = editId ? S.transactions.find(x => x.id === editId) : null;
+  // Tanggal awal form: transaksi yg diedit > tanggal yg diklik di kalender > hari ini (tetap bisa diubah user)
+  const initDate = t ? t.date : (/^\d{4}-\d{2}-\d{2}$/.test(presetDate||'') ? presetDate : today());
   if (t && t.transferId) { toast('Transaksi transfer diedit lewat menu Transfer','info'); }
   _txnType = t ? t.type : 'expense';
 
@@ -2008,7 +2095,7 @@ window.openTxnModal = function(editId) {
       </div>
     </div>
     <div class="grid-2">
-      <div class="form-group"><label class="form-label">Tanggal</label><input type="date" class="form-input" id="tf-date" value="${t?t.date:today()}"></div>
+      <div class="form-group"><label class="form-label">Tanggal</label><input type="date" class="form-input" id="tf-date" value="${initDate}"></div>
       <div class="form-group"><label class="form-label">Jumlah</label><input type="text" class="form-input" id="tf-amt" placeholder="0" value="${t?groupInt(t.amount):''}" inputmode="numeric" oninput="liveFormatAmount(this)"></div>
     </div>
     <div class="form-group"><label class="form-label">Deskripsi</label><input type="text" class="form-input" id="tf-desc" placeholder="Contoh: Gaji bulanan" value="${esc(t?t.description:'')}" maxlength="120"></div>
@@ -2257,7 +2344,7 @@ function fillBudgetDetailBody(b) {
         <b style="font-family:'Outfit';font-size:16px">${_budDetailYear}</b>
         <button class="btn-icon" onclick="_budDetailYear++;fillBudgetDetailBody(S.budgets.find(x=>x.id==='${b.id}'))"><i class="fa-solid fa-chevron-right"></i></button>
       </div>
-      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+      <div class="budd-month-grid" style="display:grid;gap:8px">
         ${MO_FULL.map((mLabel,i) => {
           const spent = filterReal(txnsInMonth(_budDetailYear, i+1)).filter(t=>t.categoryId===b.categoryId&&t.type==='expense').reduce((s,t)=>s+t.amount,0);
           const hasData = spent > 0;
@@ -2297,7 +2384,7 @@ function fillBudgetDetailBody(b) {
 
   // harian — 14 hari terakhir
   const days = []; for (let i=13;i>=0;i--){ const d=new Date(); d.setDate(d.getDate()-i); days.push(localDateStr(d)); }
-  body.innerHTML = `<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px">
+  body.innerHTML = `<div class="budd-day-grid" style="display:grid;gap:6px">
     ${days.map(dateStr => {
       const spent = filterReal(txnsOnDate(dateStr)).filter(t=>t.categoryId===b.categoryId&&t.type==='expense').reduce((s,t)=>s+t.amount,0);
       const hasData = spent > 0;
@@ -3084,7 +3171,7 @@ function fillTargetHarian() {
       <b style="font-family:'Outfit'">${monthLabel}</b>
       <button class="btn-icon" onclick="targetHarianShiftWeek(1)"><i class="fa-solid fa-chevron-right"></i></button>
     </div>
-    <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-bottom:16px">
+    <div class="target-week-grid" style="display:grid;gap:6px;margin-bottom:16px">
       ${days.map((d,i)=>{
         const isSel = d === _targetHarianDate;
         const isToday = d === today();
@@ -3098,14 +3185,24 @@ function fillTargetHarian() {
 
   const dateStr = _targetHarianDate;
   const dateLabel = new Date(dateStr+'T00:00:00').toLocaleDateString('id-ID',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
-  const list = S.targets.filter(t => t.period === 'harian');
+  const dow = new Date(dateStr+'T00:00:00').getDay();
+  // Cakupan: tanpa daysOfWeek/specificDate = "Semua Hari" (default lama, tetap kompatibel).
+  // Kalau specificDate diisi → HANYA muncul di tanggal itu (one-off). Kalau daysOfWeek diisi → hanya di hari itu tiap minggu.
+  const scopeMatches = t => {
+    if (t.specificDate) return t.specificDate === dateStr;
+    if (t.daysOfWeek && t.daysOfWeek.length) return t.daysOfWeek.includes(dow);
+    return true;
+  };
+  const allHarian = S.targets.filter(t => t.period === 'harian');
+  const list = allHarian.filter(t => t.mode === 'jadwal' || scopeMatches(t));
   const jadwalList = list.filter(t=>t.mode==='jadwal');
   const others = list.filter(t=>t.mode!=='jadwal');
 
   grid.innerHTML = `<div style="grid-column:1/-1">${nav}
     <div style="font-weight:700;font-size:13px;color:var(--tx2);margin-bottom:10px">${dateStr===today()?'📍 Hari Ini — ':''}${dateLabel}</div>
   </div>` +
-    (!list.length ? `<div class="card empty-state" style="grid-column:1/-1"><i class="fa-solid fa-list-check"></i><p>Belum ada target harian. Bisa Nominal, Checklist, atau Jadwal (jam per jam — bisa disetel beda tiap hari kalau perlu).</p></div>` :
+    (!allHarian.length ? `<div class="card empty-state" style="grid-column:1/-1"><i class="fa-solid fa-list-check"></i><p>Belum ada target harian. Bisa Nominal, Checklist, atau Jadwal (jam per jam — bisa disetel beda tiap hari kalau perlu).</p></div>` :
+    !list.length ? `<div class="card empty-state" style="grid-column:1/-1"><i class="fa-solid fa-calendar-xmark"></i><p>Tidak ada target yang dijadwalkan utk hari ini. Ada target lain yang dikhususkan utk hari/tanggal lain.</p></div>` :
     jadwalList.map(t => renderJadwalCardForDate(t, dateStr)).join('') + others.map(t => renderTargetCardForKey(t, dateStr)).join(''));
 }
 window.targetHarianShiftWeek = function(dir) {
@@ -3157,7 +3254,7 @@ function fillTargetBulanan() {
       <b style="font-family:'Outfit'">${y}</b>
       <button class="btn-icon" onclick="targetBulanShiftYear(1)"><i class="fa-solid fa-chevron-right"></i></button>
     </div>
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px">
+    <div class="target-month-grid" style="display:grid;gap:8px;margin-bottom:14px">
       ${MO_FULL.map((label,i)=>{
         const mk = `${y}-${String(i+1).padStart(2,'0')}`;
         const isSel = mk === _targetBulanKey;
@@ -3203,6 +3300,12 @@ function fillTargetTahunan() {
 window.targetTahunShift = function(dir) { _targetTahunYear += dir; fillTargetTahunan(); };
 
 // ── Kartu generik Nominal/Checklist utk PERIODE MANAPUN (bukan cuma "sekarang") ──
+function scopeLabel(t) {
+  if (t.period !== 'harian') return '';
+  if (t.specificDate) return `<span class="badge" style="background:var(--gold-l);color:var(--gold);font-size:9px;margin-left:6px"><i class="fa-solid fa-calendar-day" style="font-size:8px"></i> ${new Date(t.specificDate+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short'})} saja</span>`;
+  if (t.daysOfWeek && t.daysOfWeek.length) return `<span class="badge" style="background:var(--acc-l);color:var(--acc);font-size:9px;margin-left:6px">${t.daysOfWeek.map(d=>DOW_LABELS[d]).join(',')}</span>`;
+  return '';
+}
 function renderTargetCardForKey(t, pKey) {
   if (t.mode === 'nominal') {
     const p = targetProgressForKey(t, pKey);
@@ -3211,7 +3314,7 @@ function renderTargetCardForKey(t, pKey) {
     return `<div class="card">
       <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px">
         <div>
-          <div style="font-weight:700;font-size:14px">${esc(t.title)}</div>
+          <div style="font-weight:700;font-size:14px">${esc(t.title)}${scopeLabel(t)}</div>
           <div style="font-size:11px;color:var(--txm)">${t.basis==='kategori'?`% dari kategori "${esc(catObj(t.incomeCatId).name)}" → "${esc(catObj(t.expenseCatId).name)}"`:(t.goalType==='hemat'?'Target hemat (pemasukan − pengeluaran)':'Batas maksimal pengeluaran')} · Otomatis dari transaksi</div>
         </div>
         <div style="display:flex;gap:4px">
@@ -3231,7 +3334,7 @@ function renderTargetCardForKey(t, pKey) {
   return `<div class="card">
     <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:8px">
       <div>
-        <div style="font-weight:700;font-size:14px">${esc(t.title)}</div>
+        <div style="font-weight:700;font-size:14px">${esc(t.title)}${scopeLabel(t)}</div>
         ${t.description?`<div style="font-size:11.5px;color:var(--tx2);margin-top:3px">${esc(t.description)}</div>`:''}
       </div>
       <div style="display:flex;gap:4px">
@@ -3325,11 +3428,27 @@ window.saveScheduleOverride = async function(id, dateStr) {
 
 let _targetMode = 'nominal';
 let _targetBasis = 'total';
+let _targetScope = 'all'; // all | days | date — cakupan khusus utk target periode Harian
+const DOW_LABELS = ['Min','Sen','Sel','Rab','Kam','Jum','Sab'];
 window.openTargetModal = function(editId) {
   const t = editId ? S.targets.find(x=>x.id===editId) : null;
   _targetMode = t ? t.mode : 'nominal';
   _targetBasis = t ? (t.basis||'total') : 'total';
   const period = t ? t.period : (_targetTab==='harian'||_targetTab==='mingguan'||_targetTab==='bulanan'||_targetTab==='tahunan' ? _targetTab : 'harian');
+  // Cakupan: kalau edit, pakai yg tersimpan. Kalau BARU dan dibuka dari tab Harian, otomatis
+  // sarankan hari yg SEDANG DILIHAT (mis. lagi lihat Sabtu → GYM otomatis tersaran utk Sabtu saja).
+  let _scopeDays;
+  if (t) {
+    _targetScope = t.specificDate ? 'date' : (t.daysOfWeek && t.daysOfWeek.length ? 'days' : 'all');
+    _scopeDays = new Set(t.daysOfWeek || []);
+  } else if (_targetTab === 'harian') {
+    _targetScope = 'days';
+    _scopeDays = new Set([ new Date(_targetHarianDate+'T00:00:00').getDay() ]);
+  } else {
+    _targetScope = 'all';
+    _scopeDays = new Set();
+  }
+  window._scopeDaysSet = _scopeDays;
   const incomeCats = S.categories.filter(c=>c.type==='income');
   const expenseCats = S.categories.filter(c=>c.type==='expense');
   openModal(`
@@ -3346,6 +3465,26 @@ window.openTargetModal = function(editId) {
       </div>
     </div>
     <div class="form-group"><label class="form-label">Judul Target</label><input type="text" class="form-input" id="tf-title" placeholder="Contoh: Hemat harian / Jadwal Harian / Invest dari Ngojol" value="${esc(t?t.title:'')}" maxlength="60"></div>
+
+    <div id="tf-scope-wrap" style="${period==='harian' && _targetMode!=='jadwal' ? '' : 'display:none'}">
+      <div class="form-group"><label class="form-label">Terapkan Ke</label>
+        <div class="type-toggle" id="tscopetog">
+          <button class="${_targetScope==='all'?'sel-active':''}" data-s="all">Semua Hari</button>
+          <button class="${_targetScope==='days'?'sel-active':''}" data-s="days">Hari Tertentu</button>
+          <button class="${_targetScope==='date'?'sel-active':''}" data-s="date">Tanggal Tertentu</button>
+        </div>
+      </div>
+      <div id="tf-scope-days" style="${_targetScope!=='days'?'display:none':''};margin-bottom:14px">
+        <div style="display:flex;gap:5px;flex-wrap:wrap">
+          ${[1,2,3,4,5,6,0].map(d=>`<button type="button" class="btn btn-sm scope-day-btn ${_scopeDays.has(d)?'btn-primary':''}" data-day="${d}" style="min-width:44px;justify-content:center">${DOW_LABELS[d]}</button>`).join('')}
+        </div>
+        <p style="font-size:10.5px;color:var(--txm);margin-top:6px">Target ini cuma muncul & dihitung pada hari yang dipilih.</p>
+      </div>
+      <div id="tf-scope-date" style="${_targetScope!=='date'?'display:none':''};margin-bottom:14px">
+        <input type="date" class="form-input" id="tf-scope-datepick" value="${t&&t.specificDate?t.specificDate:_targetHarianDate}">
+        <p style="font-size:10.5px;color:var(--txm);margin-top:6px">Target ini cuma berlaku SEKALI, di tanggal ini saja.</p>
+      </div>
+    </div>
 
     <div id="tf-nominal-fields" style="${_targetMode!=='nominal'?'display:none':''}">
       <div class="form-group"><label class="form-label">Basis Perhitungan</label>
@@ -3399,6 +3538,8 @@ window.openTargetModal = function(editId) {
       document.getElementById('tf-nominal-fields').style.display   = _targetMode==='nominal'?'':'none';
       document.getElementById('tf-checklist-fields').style.display = _targetMode==='checklist'?'':'none';
       document.getElementById('tf-jadwal-fields').style.display    = _targetMode==='jadwal'?'':'none';
+      const periodNow = document.getElementById('tf-period').value;
+      document.getElementById('tf-scope-wrap').style.display = (periodNow==='harian' && _targetMode!=='jadwal') ? '' : 'none';
       if (_targetMode === 'jadwal') { document.getElementById('tf-period').value='harian'; document.getElementById('tf-period').disabled=true; }
       else { document.getElementById('tf-period').disabled=false; }
     };
@@ -3412,6 +3553,25 @@ window.openTargetModal = function(editId) {
       document.getElementById('tf-kategori-fields').style.display = _targetBasis==='kategori'?'':'none';
     };
   });
+  document.getElementById('tf-period').addEventListener('change', (e) => {
+    document.getElementById('tf-scope-wrap').style.display = (e.target.value==='harian' && _targetMode!=='jadwal') ? '' : 'none';
+  });
+  document.querySelectorAll('#tscopetog button').forEach(btn => {
+    btn.onclick = () => {
+      _targetScope = btn.dataset.s;
+      document.querySelectorAll('#tscopetog button').forEach(b => b.className = '');
+      btn.className = 'sel-active';
+      document.getElementById('tf-scope-days').style.display = _targetScope==='days'?'':'none';
+      document.getElementById('tf-scope-date').style.display = _targetScope==='date'?'':'none';
+    };
+  });
+  document.querySelectorAll('.scope-day-btn').forEach(btn => {
+    btn.onclick = () => {
+      const d = Number(btn.dataset.day);
+      if (window._scopeDaysSet.has(d)) { window._scopeDaysSet.delete(d); btn.classList.remove('btn-primary'); }
+      else { window._scopeDaysSet.add(d); btn.classList.add('btn-primary'); }
+    };
+  });
   if (_targetMode === 'jadwal') document.getElementById('tf-period').disabled = true;
 };
 window.saveTarget = async function(editId) {
@@ -3419,6 +3579,20 @@ window.saveTarget = async function(editId) {
   const title  = document.getElementById('tf-title').value.trim();
   if (!title) { toast('Judul target harus diisi','error'); return; }
   let data = { period: _targetMode==='jadwal'?'harian':period, mode:_targetMode, title };
+  // Cakupan hari/tanggal — hanya relevan utk target periode Harian yg bukan mode jadwal
+  if (data.period === 'harian' && _targetMode !== 'jadwal') {
+    if (_targetScope === 'days') {
+      const days = [...(window._scopeDaysSet||[])];
+      if (!days.length) { toast('Pilih minimal 1 hari','error'); return; }
+      data.daysOfWeek = days; data.specificDate = null;
+    } else if (_targetScope === 'date') {
+      const dp = document.getElementById('tf-scope-datepick').value;
+      if (!dp) { toast('Pilih tanggalnya','error'); return; }
+      data.specificDate = dp; data.daysOfWeek = null;
+    } else {
+      data.daysOfWeek = null; data.specificDate = null;
+    }
+  }
   if (_targetMode === 'nominal') {
     data.basis = _targetBasis;
     if (_targetBasis === 'kategori') {
@@ -3453,7 +3627,10 @@ window.saveTarget = async function(editId) {
   } catch(e) { toast('Gagal: '+e.message,'error'); if(btn){btn.disabled=false;btn.textContent=editId?'Simpan':'Tambah';} }
 };
 window.delTarget = function(id) {
-  confirmDel('Hapus target ini?', async ()=>{ await fbDelTarget(id); toast('Target dihapus','info'); renderPage(); });
+  const t = S.targets.find(x=>x.id===id);
+  const scopeNote = t && t.specificDate ? ` (target ini khusus tanggal ${new Date(t.specificDate+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'})})`
+    : t && t.daysOfWeek && t.daysOfWeek.length ? ` (target ini khusus hari ${t.daysOfWeek.map(d=>DOW_LABELS[d]).join(', ')})` : '';
+  confirmDel(`Hapus target ini sepenuhnya${scopeNote}? Tindakan ini tidak bisa dibatalkan.`, async ()=>{ await fbDelTarget(id); toast('Target dihapus','info'); renderPage(); });
 };
 window.toggleTargetDone = async function(id) {
   const t = S.targets.find(x=>x.id===id); if (!t) return;
@@ -3475,21 +3652,59 @@ window.openBulkChecklistModal = function() {
     <div class="form-group"><label class="form-label">Periode</label>
       <select class="form-input" id="bc-period">${TARGET_TABS.map(x=>`<option value="${x.id}"${_targetTab===x.id?' selected':''}>${x.label}</option>`).join('')}</select>
     </div>
+    <div id="bc-scope-wrap" style="${_targetTab==='harian'?'':'display:none'}">
+      <div class="form-group"><label class="form-label">Terapkan Ke <span style="font-weight:400;color:var(--txm)">(berlaku utk semua judul di bawah)</span></label>
+        <div class="type-toggle" id="bctscopetog">
+          <button class="sel-active" data-s="all">Semua Hari</button>
+          <button data-s="days">Hari Tertentu</button>
+        </div>
+      </div>
+      <div id="bc-scope-days" style="display:none;margin-bottom:12px">
+        <div style="display:flex;gap:5px;flex-wrap:wrap">
+          ${[1,2,3,4,5,6,0].map(d=>`<button type="button" class="btn btn-sm bc-scope-day-btn" data-day="${d}" style="min-width:44px;justify-content:center">${DOW_LABELS[d]}</button>`).join('')}
+        </div>
+      </div>
+    </div>
     <div class="form-group"><label class="form-label">Satu judul per baris</label><textarea class="form-input" id="bc-titles" rows="6" placeholder="MAXIM
 KULIAH
 BELAJAR HAL BARU
 IBADAH"></textarea></div>
   </div>
   <div class="modal-footer"><button class="btn" onclick="closeModal()">Batal</button><button class="btn btn-primary" id="bc-save-btn" onclick="saveBulkChecklist()">Tambah Semua</button></div>`);
+  document.getElementById('bc-period').addEventListener('change', e => {
+    document.getElementById('bc-scope-wrap').style.display = e.target.value==='harian' ? '' : 'none';
+  });
+  window._bcScope = 'all'; window._bcScopeDays = new Set();
+  document.querySelectorAll('#bctscopetog button').forEach(btn => {
+    btn.onclick = () => {
+      window._bcScope = btn.dataset.s;
+      document.querySelectorAll('#bctscopetog button').forEach(b=>b.className='');
+      btn.className = 'sel-active';
+      document.getElementById('bc-scope-days').style.display = window._bcScope==='days' ? '' : 'none';
+    };
+  });
+  document.querySelectorAll('.bc-scope-day-btn').forEach(btn => {
+    btn.onclick = () => {
+      const d = Number(btn.dataset.day);
+      if (window._bcScopeDays.has(d)) { window._bcScopeDays.delete(d); btn.classList.remove('btn-primary'); }
+      else { window._bcScopeDays.add(d); btn.classList.add('btn-primary'); }
+    };
+  });
 };
 window.saveBulkChecklist = async function() {
   const period = document.getElementById('bc-period').value;
   const titles = document.getElementById('bc-titles').value.split('\n').map(s=>s.trim()).filter(Boolean);
   if (!titles.length) { toast('Isi minimal 1 judul','error'); return; }
+  if (period === 'harian' && window._bcScope === 'days' && !window._bcScopeDays.size) { toast('Pilih minimal 1 hari','error'); return; }
+  const daysOfWeek = (period==='harian' && window._bcScope==='days') ? [...window._bcScopeDays] : null;
   const btn = document.getElementById('bc-save-btn');
   if (btn) { btn.disabled=true; btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> Menyimpan...'; }
   try {
-    for (const title of titles) await fbSaveTarget({ period, mode:'checklist', title, description:'', completedPeriods:[] }, null);
+    for (const title of titles) {
+      const data = { period, mode:'checklist', title, description:'', completedPeriods:[] };
+      if (daysOfWeek) { data.daysOfWeek = daysOfWeek; data.specificDate = null; }
+      await fbSaveTarget(data, null);
+    }
     _targetTab = period;
     toast(`${titles.length} target ditambahkan`); closeModal(); renderPage();
   } catch(e) { toast('Gagal: '+e.message,'error'); if(btn){btn.disabled=false;btn.textContent='Tambah Semua';} }
@@ -3580,8 +3795,28 @@ function renderReportCharts() {
 
 /* ── SETTINGS ── */
 function rSet(el) {
+  const isGoogle = currentUser?.providerData?.[0]?.providerId === 'google.com';
+  const initial = currentUser?.email?.[0]?.toUpperCase() || 'U';
+  const dispName = currentUser?.displayName || currentUser?.email?.split('@')[0] || 'Pengguna';
   el.innerHTML = `
   <div style="max-width:580px">
+    <div class="card" style="margin-bottom:16px">
+      <h4 style="font-size:15px;margin-bottom:14px">Akun Login</h4>
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
+        <div class="user-avatar" style="width:48px;height:48px;font-size:17px;flex-shrink:0">${esc(initial)}</div>
+        <div style="min-width:0">
+          <div style="font-weight:700;font-size:14.5px">${esc(dispName)}</div>
+          <div style="font-size:11.5px;color:var(--txm);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(currentUser?.email||'')}</div>
+          <span class="badge" style="background:var(--acc-l);color:var(--acc);margin-top:5px;font-size:10px"><i class="${isGoogle?'fa-brands fa-google':'fa-solid fa-envelope'}"></i> ${isGoogle?'Masuk dengan Google':'Email & Kata Sandi'}</span>
+        </div>
+      </div>
+      <p style="font-size:11px;color:var(--txm);margin-bottom:12px">Semua data keuangan Anda tersimpan di cloud, terikat pada akun ini, dan hanya bisa diakses lewat login ini.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        ${isGoogle?`<button class="btn btn-sm" onclick="switchGoogleAccount()"><i class="fa-solid fa-right-left"></i> Ganti Akun</button>`:''}
+        <button class="btn btn-sm btn-danger" onclick="handleLogout()"><i class="fa-solid fa-right-from-bracket"></i> Keluar</button>
+      </div>
+    </div>
+
     <div class="card" style="margin-bottom:16px">
       <h4 style="font-size:15px;margin-bottom:16px">Tampilan</h4>
       <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid var(--border)">
@@ -3594,14 +3829,16 @@ function rSet(el) {
     </div>
 
     <div class="card" style="margin-bottom:16px">
-      <h4 style="font-size:15px;margin-bottom:14px">Mata Uang</h4>
-      <select class="form-input" id="sf-cur" style="width:190px" onchange="S.settings.currency=this.value;saveSettings();renderPage()">
-        <option value="Rp"${S.settings.currency==='Rp'?' selected':''}>Rp — Rupiah</option>
-        <option value="$"${S.settings.currency==='$'?' selected':''}>$ — Dollar</option>
-        <option value="€"${S.settings.currency==='€'?' selected':''}>€ — Euro</option>
-        <option value="¥"${S.settings.currency==='¥'?' selected':''}>¥ — Yen</option>
-        <option value="£"${S.settings.currency==='£'?' selected':''}>£ — Pound</option>
+      <h4 style="font-size:15px;margin-bottom:6px">Mata Uang & Negara Asal</h4>
+      <p style="font-size:11.5px;color:var(--tx2);margin-bottom:12px">Ini jadi basis tampilan angka di seluruh aplikasi, DAN basis perbandingan kurs mata uang asing di Dashboard.</p>
+      <select class="form-input" id="sf-cur" style="width:220px" onchange="S.settings.currency=this.value;saveSettings();renderPage()">
+        <option value="Rp"${S.settings.currency==='Rp'?' selected':''}>Rp — Indonesia (Rupiah)</option>
+        <option value="$"${S.settings.currency==='$'?' selected':''}>$ — Amerika Serikat (Dollar)</option>
+        <option value="€"${S.settings.currency==='€'?' selected':''}>€ — Kawasan Euro (Euro)</option>
+        <option value="¥"${S.settings.currency==='¥'?' selected':''}>¥ — Jepang (Yen)</option>
+        <option value="£"${S.settings.currency==='£'?' selected':''}>£ — Inggris (Pound)</option>
       </select>
+      <div id="settings-fx-preview" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)"></div>
     </div>
 
     <div class="card" style="margin-bottom:16px;position:relative;overflow:hidden">
@@ -3632,10 +3869,11 @@ function rSet(el) {
     </div>
 
     <div class="card" style="margin-bottom:16px">
-      <h4 style="font-size:15px;margin-bottom:14px">Data & Sinkronisasi</h4>
+      <h4 style="font-size:15px;margin-bottom:6px">Data & Sinkronisasi</h4>
+      <p style="font-size:11.5px;color:var(--tx2);margin-bottom:12px">Ekspor CSV siap dibuka rapi di Excel/Google Sheets (kolom Jumlah tetap angka, bisa langsung di-SUM).</p>
       <div style="display:flex;gap:9px;flex-wrap:wrap;margin-bottom:12px">
-        <button class="btn btn-sm" onclick="exportCSV()"><i class="fa-solid fa-download"></i> Ekspor CSV</button>
-        <button class="btn btn-sm" onclick="exportJSON()"><i class="fa-solid fa-file-export"></i> Ekspor JSON</button>
+        <button class="btn btn-sm" onclick="exportCSV()"><i class="fa-solid fa-file-csv"></i> Ekspor CSV</button>
+        <button class="btn btn-sm" onclick="exportJSON()"><i class="fa-solid fa-file-export"></i> Ekspor Backup JSON</button>
         <button class="btn btn-sm" onclick="importData()"><i class="fa-solid fa-upload"></i> Impor Data</button>
       </div>
       <button class="btn btn-sm btn-danger" onclick="resetAll()"><i class="fa-solid fa-trash"></i> Hapus Semua Data Akun Ini</button>
@@ -3653,6 +3891,7 @@ function rSet(el) {
     </div>
   </div>`;
   fillSetCats();
+  fillSettingsFxPreview();
 }
 
 function fillSetCats() {
@@ -3705,20 +3944,36 @@ window.delCat = function(id) {
 };
 
 /* ── EXPORT / IMPORT ── */
+/* ── EXPORT / IMPORT ──
+   CSV dibuat mengikuti RFC 4180 (CRLF, field teks di-quote, field angka polos
+   supaya tetap numeric & bisa langsung di-SUM di Excel/Sheets — bukan text).
+   Field teks yg diawali =,+,-,@ diberi prefiks ' utk cegah CSV/formula injection
+   saat dibuka di Excel (angka Jumlah tidak disentuh krn memang murni angka). */
+function csvText(v) {
+  let s = String(v ?? '');
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  return `"${s.replace(/"/g,'""')}"`;
+}
 window.exportCSV = function() {
-  const h=['Tanggal','Tipe','Kategori','Akun','Deskripsi','Jumlah','Catatan'];
-  const r=S.transactions.sort((a,b)=>new Date(b.date)-new Date(a.date)).map(t=>
-    [t.date,t.type==='income'?'Pemasukan':'Pengeluaran',catObj(t.categoryId).name,accObj(t.accountId).name,t.description,t.amount,t.note||''].map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',')
-  );
-  const csv='\uFEFF'+[h.join(','),...r].join('\n');
-  const b=new Blob([csv],{type:'text/csv;charset=utf-8;'});
-  const u=URL.createObjectURL(b); const a=document.createElement('a'); a.href=u; a.download=`fintrack_${today()}.csv`; a.click(); URL.revokeObjectURL(u);
-  toast('Data diekspor ke CSV');
+  const h = ['Tanggal','Tipe','Kategori','Akun','Deskripsi','Jumlah','Catatan'].map(csvText);
+  const rows = [...S.transactions].sort((a,b)=>new Date(b.date)-new Date(a.date)).map(t => [
+    csvText(t.date),
+    csvText(t.type==='income'?'Pemasukan':'Pengeluaran'),
+    csvText(catObj(t.categoryId).name),
+    csvText(accObj(t.accountId).name),
+    csvText(t.description),
+    Number(t.amount)||0,
+    csvText(t.note||'')
+  ].join(','));
+  const csv = '\uFEFF' + [h.join(','), ...rows].join('\r\n');
+  const b = new Blob([csv], { type:'text/csv;charset=utf-8;' });
+  const u = URL.createObjectURL(b); const a=document.createElement('a'); a.href=u; a.download=`money-management_transaksi_${today()}.csv`; a.click(); URL.revokeObjectURL(u);
+  toast('Data diekspor ke CSV — siap dibuka rapi di Excel/Sheets');
 };
 window.exportJSON = function() {
   const d=JSON.stringify({accounts:S.accounts,categories:S.categories,transactions:S.transactions,budgets:S.budgets,goals:S.goals,settings:S.settings},null,2);
   const b=new Blob([d],{type:'application/json'});
-  const u=URL.createObjectURL(b); const a=document.createElement('a'); a.href=u; a.download=`fintrack_backup_${today()}.json`; a.click(); URL.revokeObjectURL(u);
+  const u=URL.createObjectURL(b); const a=document.createElement('a'); a.href=u; a.download=`money-management_backup_${today()}.json`; a.click(); URL.revokeObjectURL(u);
   toast('Backup JSON diekspor');
 };
 window.importData = function() {

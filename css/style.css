@@ -965,3 +965,57 @@ select.form-input option{background:var(--bg2)}
 @media(max-width:640px){
   .ladder-step-body > div{ flex-direction:column; align-items:stretch!important; }
 }
+
+/* ═══════════════════════════════════════════
+   KURS MATA UANG (Dashboard & Pengaturan)
+═══════════════════════════════════════════ */
+.fx-grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:10px; }
+.fx-item{ padding:11px 10px; border-radius:11px; background:var(--bg2); border:1px solid var(--border); text-align:center; box-shadow:var(--neu-pressed-sm); }
+.fx-code{ font-size:11px; color:var(--txm); font-weight:800; letter-spacing:.4px; }
+.fx-val{ font-family:'Outfit'; font-size:14.5px; font-weight:800; margin-top:4px; color:var(--tx); word-break:break-word; }
+@media(max-width:480px){ .fx-grid{ grid-template-columns:repeat(2,1fr); } .fx-val{ font-size:13px; } }
+
+/* ═══════════════════════════════════════════
+   RESPONSIVE — grid-grid kalender/target yang
+   dulunya inline (supaya bisa dikecilkan di HP)
+═══════════════════════════════════════════ */
+.cal-summary-chips3{ grid-template-columns:repeat(3,1fr); }
+.budd-month-grid{ grid-template-columns:repeat(3,1fr); }
+.budd-day-grid{ grid-template-columns:repeat(7,1fr); }
+.target-week-grid{ grid-template-columns:repeat(7,1fr); }
+.target-month-grid{ grid-template-columns:repeat(4,1fr); }
+
+@media(max-width:480px){
+  .cal-summary-chips3{ grid-template-columns:1fr; gap:6px!important; }
+  .budd-month-grid{ grid-template-columns:repeat(2,1fr); }
+  .budd-day-grid{ grid-template-columns:repeat(4,1fr); }
+  .target-week-grid{ grid-template-columns:repeat(4,1fr); row-gap:8px!important; }
+  .target-month-grid{ grid-template-columns:repeat(3,1fr); }
+}
+@media(max-width:360px){
+  .budd-day-grid{ grid-template-columns:repeat(3,1fr); }
+  .target-week-grid{ grid-template-columns:repeat(3,1fr); }
+}
+
+/* Modal lebih lega di layar sempit + input/tombol tidak kepotong */
+@media(max-width:480px){
+  .modal-header{ padding:14px 16px; }
+  .modal-body{ padding:16px; }
+  .modal-footer{ padding:12px 16px; flex-wrap:wrap; }
+  .modal-footer .btn{ flex:1; min-width:120px; justify-content:center; }
+  .type-toggle{ flex-wrap:wrap; }
+  .type-toggle button{ min-width:70px; }
+}
+
+/* Ladder/jadwal timeline tetap terbaca di layar sempit */
+@media(max-width:480px){
+  .ladder-step-body > div{ flex-direction:column!important; align-items:stretch!important; gap:8px; }
+  .ladder-step-body .btn-sm{ width:100%; justify-content:center; }
+}
+
+/* Topbar: tombol jangan dempet / overflow di layar sangat sempit */
+@media(max-width:360px){
+  #topbar{ gap:6px; }
+  .topbar-right{ gap:6px!important; }
+  .topbar-right .btn-primary span{ display:none; } /* ikon + saja, teks "Transaksi" disembunyikan */
+}

@@ -92,6 +92,8 @@ service cloud.firestore {
         && (!('expenseCatId' in d) || d.expenseCatId is string)
         && (!('amount' in d)   || (d.amount is number && d.amount > 0 && d.amount < 999999999999))
         && (!('completedPeriods' in d) || d.completedPeriods is list)
+        && (!('daysOfWeek' in d)       || d.daysOfWeek == null || d.daysOfWeek is list)
+        && (!('specificDate' in d)     || d.specificDate == null || d.specificDate is string)
         && (!('schedules' in d)        || d.schedules is map)
         && (!('overrides' in d)        || d.overrides is map)
         && (!('completedBlocks' in d)  || d.completedBlocks is map);
@@ -141,7 +143,8 @@ service cloud.firestore {
         allow delete:        if isOwner(userId);
       }
 
-      // Settings cuma berisi { theme, currency } — risiko rendah, cukup cek kepemilikan
+      // Settings: { theme, currency, wealthLadder:{...} } — semuanya preferensi/status
+      // pribadi non-sensitif, risiko rendah, cukup cek kepemilikan (bukan data finansial inti).
       match /settings/{settingId} {
         allow read, write: if isOwner(userId);
       }
