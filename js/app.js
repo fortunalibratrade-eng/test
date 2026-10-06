@@ -184,26 +184,47 @@ const CUR_ISO = { 'Rp':'IDR', '$':'USD', '€':'EUR', '¥':'JPY', '£':'GBP' };
 const FX_MAJORS = ['USD','EUR','GBP','JPY','SGD','AUD','MYR','CNY'];
 let _fxCache = null;
 // Cache di localStorage 6 jam supaya hemat kuota API & tetap tampil (walau agak basi) kalau offline/API down.
+// Provider 1: Frankfurter (ECB). Base bisa currency apapun krn dihitung cross-rate via EUR.
+async function fetchFxFromFrankfurter(baseIso) {
+  const symbols = FX_MAJORS.filter(c=>c!==baseIso).join(',');
+  const res = await fetch(`https://api.frankfurter.app/latest?from=${baseIso}&to=${symbols}`);
+  if (!res.ok) throw new Error('Frankfurter HTTP '+res.status);
+  const data = await res.json();
+  const rates = {};
+  Object.entries(data.rates||{}).forEach(([k,v]) => { if (v>0) rates[k] = 1/v; }); // invert: "1 IDR=0.00006 USD" → "1 USD=X IDR"
+  if (!Object.keys(rates).length) throw new Error('Frankfurter: data kosong');
+  return { rates, date: data.date };
+}
+// Provider 2 (cadangan kalau provider 1 down/limit): open.er-api.com — juga gratis, tanpa API key.
+async function fetchFxFromErApi(baseIso) {
+  const res = await fetch(`https://open.er-api.com/v6/latest/${baseIso}`);
+  if (!res.ok) throw new Error('ER-API HTTP '+res.status);
+  const data = await res.json();
+  if (data.result !== 'success') throw new Error('ER-API: respons gagal');
+  const rates = {};
+  FX_MAJORS.filter(c=>c!==baseIso).forEach(c => { const v = data.rates?.[c]; if (v>0) rates[c] = 1/v; });
+  if (!Object.keys(rates).length) throw new Error('ER-API: data kosong');
+  const date = data.time_last_update_utc ? new Date(data.time_last_update_utc).toISOString().slice(0,10) : null;
+  return { rates, date };
+}
+// Cache 6 jam di localStorage + 2 provider berurutan, supaya kurs SELALU berhasil tampil
+// kecuali keduanya down bersamaan DAN belum pernah berhasil fetch sebelumnya di device ini.
 async function fetchFxRates(baseIso) {
   const cacheKey = 'mm_fx_' + baseIso;
   let cached = null;
   try { cached = JSON.parse(localStorage.getItem(cacheKey) || 'null'); } catch(e) {}
   if (cached && (Date.now() - cached.fetchedAt) < 6*3600*1000) { _fxCache = cached; return cached; }
-  try {
-    const symbols = FX_MAJORS.filter(c=>c!==baseIso).join(',');
-    const res = await fetch(`https://api.frankfurter.app/latest?from=${baseIso}&to=${symbols}`);
-    if (!res.ok) throw new Error('HTTP '+res.status);
-    const data = await res.json();
-    const rates = {};
-    Object.entries(data.rates||{}).forEach(([k,v]) => { if (v>0) rates[k] = 1/v; }); // invert: "1 IDR=0.00006 USD" → "1 USD=X IDR"
-    const result = { base: baseIso, rates, date: data.date, fetchedAt: Date.now() };
-    try { localStorage.setItem(cacheKey, JSON.stringify(result)); } catch(e) {}
-    _fxCache = result;
-    return result;
-  } catch(e) {
-    if (cached) { _fxCache = cached; return cached; } // stale tapi lebih baik drpd kosong
-    return null;
+  for (const provider of [fetchFxFromFrankfurter, fetchFxFromErApi]) {
+    try {
+      const { rates, date } = await provider(baseIso);
+      const result = { base: baseIso, rates, date, fetchedAt: Date.now() };
+      try { localStorage.setItem(cacheKey, JSON.stringify(result)); } catch(e) {}
+      _fxCache = result;
+      return result;
+    } catch(e) { /* coba provider berikutnya */ }
   }
+  if (cached) { _fxCache = cached; return cached; } // stale tapi lebih baik drpd kosong
+  return null;
 }
 const fmt = n => {
   const cur = S.settings?.currency || 'Rp';
@@ -2104,6 +2125,17 @@ window.openTxnModal = function(editId, presetDate) {
       <div class="form-group"><label class="form-label">Akun</label><select class="form-input" id="tf-acc">${S.accounts.map(a=>`<option value="${a.id}"${t&&t.accountId===a.id?' selected':''}>${esc(a.name)}</option>`).join('')}</select></div>
     </div>
     <div class="form-group"><label class="form-label">Catatan <span style="font-weight:400;color:var(--txm)">(opsional)</span></label><input type="text" class="form-input" id="tf-note" placeholder="Catatan tambahan..." value="${esc(t?t.note||'':'')}" maxlength="200"></div>
+    ${!editId ? `
+    <div id="tf-debtlink-wrap" style="padding:12px;border-radius:10px;background:var(--bg2);border:1px solid var(--border);display:none">
+      <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:var(--tx2);cursor:pointer;margin-bottom:0">
+        <input type="checkbox" id="tf-debtlink-chk" style="width:16px;height:16px" onchange="toggleTxnDebtLinkUI(this.checked)">
+        <span id="tf-debtlink-label">Ini pembayaran Hutang Saya?</span>
+      </label>
+      <div id="tf-debtlink-sel" style="display:none;margin-top:10px">
+        <select class="form-input" id="tf-debtlink-debtid"></select>
+        <p style="font-size:10.5px;color:var(--txm);margin-top:6px">Jumlah di atas akan mengurangi sisa hutang ini dan DIKECUALIKAN dari statistik pendapatan/pengeluaran (cuma pergerakan kas). Kalau lunas, otomatis pindah ke Riwayat di halaman Hutang & Piutang.</p>
+      </div>
+    </div>` : ''}
   </div>
   <div class="modal-footer">
     <button class="btn" onclick="closeModal()">Batal</button>
@@ -2111,15 +2143,38 @@ window.openTxnModal = function(editId, presetDate) {
   </div>`);
 
   fillCatSelect(t ? t.categoryId : null);
+  if (!editId) refreshTxnDebtLinkOptions();
   document.querySelectorAll('#ttog button').forEach(btn => {
     btn.onclick = () => {
       _txnType = btn.dataset.t;
       document.querySelectorAll('#ttog button').forEach(b => b.className = '');
       btn.className = _txnType === 'income' ? 'sel-income' : 'sel-expense';
       fillCatSelect(null);
+      if (!editId) refreshTxnDebtLinkOptions();
     };
   });
   setTimeout(() => document.getElementById('tf-amt')?.focus(), 80);
+};
+
+// Dropdown "Hubungkan ke Hutang/Piutang" — hanya tampil kalau ADA hutang/piutang aktif
+// yg relevan dgn arah transaksi (Pengeluaran→Hutang Saya, Pemasukan→Piutang Saya).
+function refreshTxnDebtLinkOptions() {
+  const wrap = document.getElementById('tf-debtlink-wrap'); if (!wrap) return;
+  const relevantType = _txnType === 'expense' ? 'hutang' : 'piutang';
+  const candidates = S.debts.filter(d => d.type === relevantType && debtRemaining(d) > 0);
+  const chk = document.getElementById('tf-debtlink-chk');
+  if (chk) { chk.checked = false; }
+  const selWrap = document.getElementById('tf-debtlink-sel');
+  if (selWrap) selWrap.style.display = 'none';
+  if (!candidates.length) { wrap.style.display = 'none'; return; }
+  wrap.style.display = '';
+  const lbl = document.getElementById('tf-debtlink-label');
+  if (lbl) lbl.textContent = _txnType === 'expense' ? 'Ini pembayaran Hutang Saya?' : 'Ini penerimaan dari Piutang Saya?';
+  const sel = document.getElementById('tf-debtlink-debtid');
+  if (sel) sel.innerHTML = candidates.map(d=>`<option value="${d.id}">${esc(d.person)} — sisa ${fmt(debtRemaining(d))}</option>`).join('');
+}
+window.toggleTxnDebtLinkUI = function(checked) {
+  const el = document.getElementById('tf-debtlink-sel'); if (el) el.style.display = checked ? '' : 'none';
 };
 
 function fillCatSelect(selId) {
@@ -2145,14 +2200,42 @@ window.saveTxn = async function(editId) {
   const note   = document.getElementById('tf-note').value.trim();
   if (!date||!desc||!amount) { toast('Harap isi semua field dengan benar','error'); return; }
 
+  // Dihubungkan ke Hutang/Piutang? (hanya relevan utk transaksi BARU)
+  const linkChk = !editId && document.getElementById('tf-debtlink-chk');
+  const isLinked = !!(linkChk && linkChk.checked);
+  let linkedDebt = null;
+  if (isLinked) {
+    const debtId = document.getElementById('tf-debtlink-debtid').value;
+    linkedDebt = S.debts.find(d => d.id === debtId);
+    if (!linkedDebt) { toast('Hutang/Piutang yang dipilih tidak ditemukan','error'); return; }
+    const remaining = debtRemaining(linkedDebt);
+    if (amount > remaining) { toast(`Jumlah melebihi sisa ${linkedDebt.type==='hutang'?'hutang':'piutang'} ini (${fmt(remaining)}). Sesuaikan jumlahnya dulu.`,'error'); return; }
+  }
+
   const btn = document.getElementById('save-txn-btn');
   if (btn) { btn.disabled=true; btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> Menyimpan...'; }
   try {
-    const data = editId
-      ? { date, description:desc, amount, categoryId:catId, accountId:accId, note, type:_txnType }
-      : { date, description:desc, amount, categoryId:catId, accountId:accId, note, type:_txnType, flow:'real' };
-    if (editId) { await fbUpdateTxn(editId, data); toast('Transaksi diperbarui'); }
-    else        { await fbAddTxn(data); toast('Transaksi ditambahkan'); }
+    if (editId) {
+      const data = { date, description:desc, amount, categoryId:catId, accountId:accId, note, type:_txnType };
+      await fbUpdateTxn(editId, data); toast('Transaksi diperbarui');
+    } else if (isLinked) {
+      // Catat sbg pelunasan: pokok → flow:'hutang' (dikecualikan dari statistik), kategori otomatis
+      // "Hutang/Piutang" (konsisten dgn pelunasan lewat halaman Hutang & Piutang), dan kurangi sisa hutang.
+      const debtCat = await ensureDebtCategory(_txnType);
+      await fbAddTxn({ date, description:desc, amount, categoryId:debtCat.id, accountId:accId, note,
+        type:_txnType, flow:'hutang', debtId:linkedDebt.id });
+      const newPaid = (linkedDebt.paid||0) + amount;
+      await fbSaveDebt({ paid:newPaid }, linkedDebt.id);
+      const nowRemaining = linkedDebt.amount - newPaid;
+      if (nowRemaining <= 0) {
+        toast(`🎉 ${linkedDebt.type==='hutang'?'Hutang':'Piutang'} dengan ${linkedDebt.person} LUNAS! Dipindah ke Riwayat di halaman Hutang & Piutang.`, 'success');
+      } else {
+        toast(`Transaksi dicatat & sisa ${linkedDebt.type==='hutang'?'hutang':'piutang'} ${linkedDebt.person} kini ${fmt(nowRemaining)}`);
+      }
+    } else {
+      await fbAddTxn({ date, description:desc, amount, categoryId:catId, accountId:accId, note, type:_txnType, flow:'real' });
+      toast('Transaksi ditambahkan');
+    }
     closeModal(); renderPage(); checkBudgetAlerts();
   } catch(e) { toast('Gagal menyimpan: ' + e.message, 'error'); if(btn){btn.disabled=false;btn.textContent=editId?'Simpan Perubahan':'Tambah Transaksi';} }
 };
@@ -2481,12 +2564,20 @@ function rDebt(el) {
     </div>
   </div>
 
-  <div class="grid-auto" id="debt-grid"></div>`;
+  <div class="grid-auto" id="debt-grid"></div>
+
+  <div style="margin-top:22px">
+    <button class="btn btn-sm" id="debt-history-toggle" onclick="toggleDebtHistorySection()">
+      <i class="fa-solid fa-clock-rotate-left"></i> <span id="debt-history-toggle-label">Riwayat (Lunas)</span>
+    </button>
+    <div id="debt-history-grid" class="grid-auto" style="margin-top:14px;display:none"></div>
+  </div>`;
 
   document.querySelectorAll('#debt-ftog button').forEach(b => {
     b.onclick = () => { debtFilter = b.dataset.f; renderPage(); };
   });
   fillDebtGrid();
+  fillDebtHistoryGrid();
 }
 
 window.flipDebt3D = function() {
@@ -2494,56 +2585,74 @@ window.flipDebt3D = function() {
   if (card) card.classList.toggle('flipped');
 };
 
+let _debtHistoryOpen = false;
+window.toggleDebtHistorySection = function() {
+  _debtHistoryOpen = !_debtHistoryOpen;
+  const grid = document.getElementById('debt-history-grid');
+  if (grid) grid.style.display = _debtHistoryOpen ? '' : 'none';
+};
+
+function debtCardHtml(d, { isHistory }) {
+  const remaining = debtRemaining(d);
+  const isLunas   = remaining <= 0;
+  const isOverdue = !isLunas && d.dueDate && d.dueDate < today();
+  const pct = d.amount>0 ? Math.min(((d.paid||0)/d.amount)*100,100) : 0;
+  const isHutang = d.type === 'hutang';
+  const color = isHutang ? 'var(--expense)' : 'var(--income)';
+  const statusBadge = isLunas
+    ? `<span class="badge" style="background:var(--income-l);color:var(--income)"><i class="fa-solid fa-check"></i> Lunas</span>`
+    : isOverdue
+    ? `<span class="badge" style="background:var(--expense-l);color:var(--expense)"><i class="fa-solid fa-triangle-exclamation"></i> Jatuh Tempo</span>`
+    : `<span class="badge" style="background:${color}18;color:${color}">Berjalan</span>`;
+  return `<div class="card${isOverdue?' pulse-red':''}${isHistory?' fade-in':''}" style="${isHistory?'opacity:.85':''}">
+    <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div style="width:38px;height:38px;border-radius:10px;background:${color}18;color:${color};display:flex;align-items:center;justify-content:center;box-shadow:var(--neu-pressed-sm)">
+          <i class="fa-solid ${isHutang?'fa-arrow-up-from-bracket':'fa-arrow-down-to-bracket'}"></i>
+        </div>
+        <div>
+          <div style="font-weight:700;font-size:14px">${esc(d.person)}</div>
+          <div style="font-size:11px;color:var(--txm)">${isHutang?'Saya berhutang':'Berhutang ke saya'}${d.borrowDate?' · Pinjam '+new Date(d.borrowDate+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'}):''}${!isLunas&&d.dueDate?' · Jatuh tempo '+new Date(d.dueDate+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'}):''}</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:4px">
+        <button class="btn-icon" style="width:27px;height:27px" onclick="openDebtHistoryModal('${d.id}')" title="Riwayat transaksi"><i class="fa-solid fa-clock-rotate-left" style="font-size:9px"></i></button>
+        <button class="btn-icon" style="width:27px;height:27px" onclick="openDebtModal('${d.id}')"><i class="fa-solid fa-pen" style="font-size:9px"></i></button>
+        <button class="btn-icon" style="width:27px;height:27px;color:var(--expense)" onclick="delDebt('${d.id}')"><i class="fa-solid fa-trash" style="font-size:9px"></i></button>
+      </div>
+    </div>
+    ${d.note?`<div style="font-size:11.5px;color:var(--tx2);margin-bottom:8px;font-style:italic">"${esc(d.note)}"</div>`:''}
+    <div class="progress-bar"><div class="progress-fill" style="width:${pct}%;background:${color}"></div></div>
+    <div style="display:flex;justify-content:space-between;margin-top:7px;font-size:12.5px">
+      <span style="color:var(--tx2);font-weight:600">Terbayar ${fmt(d.paid||0)}</span>
+      <span style="color:var(--txm)">dari ${fmt(d.amount)}</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
+      ${statusBadge}
+      ${!isLunas?`<button class="btn btn-sm btn-primary" onclick="openPayDebtModal('${d.id}')">${isHutang?'Bayar':'Terima'}</button>`:''}
+    </div>
+  </div>`;
+}
+
+// Hanya yang MASIH BERJALAN (belum lunas) — yang lunas otomatis pindah ke Riwayat di bawah.
 function fillDebtGrid() {
   const grid = document.getElementById('debt-grid'); if (!grid) return;
-  let list = [...S.debts];
+  let list = S.debts.filter(d => debtRemaining(d) > 0);
   if (debtFilter !== 'all') list = list.filter(d => d.type === debtFilter);
   list.sort((a,b) => debtRemaining(b) - debtRemaining(a));
+  if (!list.length) { grid.innerHTML = '<div class="card empty-state" style="grid-column:1/-1"><i class="fa-solid fa-hand-holding-dollar"></i><p>Belum ada hutang/piutang yang berjalan.</p></div>'; return; }
+  grid.innerHTML = list.map(d => debtCardHtml(d, {isHistory:false})).join('');
+}
 
-  if (!list.length) { grid.innerHTML = '<div class="card empty-state" style="grid-column:1/-1"><i class="fa-solid fa-hand-holding-dollar"></i><p>Belum ada catatan hutang/piutang.</p></div>'; return; }
-
-  const todayStr = today();
-  grid.innerHTML = list.map(d => {
-    const remaining = debtRemaining(d);
-    const isLunas   = remaining <= 0;
-    const isOverdue = !isLunas && d.dueDate && d.dueDate < todayStr;
-    const pct = d.amount>0 ? Math.min(((d.paid||0)/d.amount)*100,100) : 0;
-    const isHutang = d.type === 'hutang';
-    const color = isHutang ? 'var(--expense)' : 'var(--income)';
-    const statusBadge = isLunas
-      ? `<span class="badge" style="background:var(--income-l);color:var(--income)"><i class="fa-solid fa-check"></i> Lunas</span>`
-      : isOverdue
-      ? `<span class="badge" style="background:var(--expense-l);color:var(--expense)"><i class="fa-solid fa-triangle-exclamation"></i> Jatuh Tempo</span>`
-      : `<span class="badge" style="background:${color}18;color:${color}">Berjalan</span>`;
-    return `<div class="card${isOverdue?' pulse-red':''}">
-      <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px">
-        <div style="display:flex;align-items:center;gap:10px">
-          <div style="width:38px;height:38px;border-radius:10px;background:${color}18;color:${color};display:flex;align-items:center;justify-content:center;box-shadow:var(--neu-pressed-sm)">
-            <i class="fa-solid ${isHutang?'fa-arrow-up-from-bracket':'fa-arrow-down-to-bracket'}"></i>
-          </div>
-          <div>
-            <div style="font-weight:700;font-size:14px">${esc(d.person)}</div>
-            <div style="font-size:11px;color:var(--txm)">${isHutang?'Saya berhutang':'Berhutang ke saya'}${d.borrowDate?' · Pinjam '+new Date(d.borrowDate+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'}):''}${d.dueDate?' · Jatuh tempo '+new Date(d.dueDate+'T00:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'}):''}</div>
-          </div>
-        </div>
-        <div style="display:flex;gap:4px">
-          <button class="btn-icon" style="width:27px;height:27px" onclick="openDebtHistoryModal('${d.id}')" title="Riwayat transaksi"><i class="fa-solid fa-clock-rotate-left" style="font-size:9px"></i></button>
-          <button class="btn-icon" style="width:27px;height:27px" onclick="openDebtModal('${d.id}')"><i class="fa-solid fa-pen" style="font-size:9px"></i></button>
-          <button class="btn-icon" style="width:27px;height:27px;color:var(--expense)" onclick="delDebt('${d.id}')"><i class="fa-solid fa-trash" style="font-size:9px"></i></button>
-        </div>
-      </div>
-      ${d.note?`<div style="font-size:11.5px;color:var(--tx2);margin-bottom:8px;font-style:italic">"${esc(d.note)}"</div>`:''}
-      <div class="progress-bar"><div class="progress-fill" style="width:${pct}%;background:${color}"></div></div>
-      <div style="display:flex;justify-content:space-between;margin-top:7px;font-size:12.5px">
-        <span style="color:var(--tx2);font-weight:600">Terbayar ${fmt(d.paid||0)}</span>
-        <span style="color:var(--txm)">dari ${fmt(d.amount)}</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
-        ${statusBadge}
-        ${!isLunas?`<button class="btn btn-sm btn-primary" onclick="openPayDebtModal('${d.id}')">${isHutang?'Bayar':'Terima'}</button>`:''}
-      </div>
-    </div>`;
-  }).join('');
+// Riwayat: hutang/piutang yang SUDAH LUNAS — disembunyikan default, biar halaman utama fokus ke yg aktif.
+function fillDebtHistoryGrid() {
+  const grid = document.getElementById('debt-history-grid'); if (!grid) return;
+  let list = S.debts.filter(d => debtRemaining(d) <= 0);
+  if (debtFilter !== 'all') list = list.filter(d => d.type === debtFilter);
+  const toggleLbl = document.getElementById('debt-history-toggle-label');
+  if (toggleLbl) toggleLbl.textContent = `Riwayat (Lunas) · ${list.length}`;
+  if (!list.length) { grid.innerHTML = '<div class="card empty-state" style="grid-column:1/-1"><i class="fa-solid fa-box-archive"></i><p>Belum ada hutang/piutang yang lunas.</p></div>'; return; }
+  grid.innerHTML = list.map(d => debtCardHtml(d, {isHistory:true})).join('');
 }
 
 const DEBT_TYPE_LABEL = { hutang: 'Hutang (Saya Berhutang)', piutang: 'Piutang (Orang Berhutang ke Saya)' };
@@ -2751,7 +2860,10 @@ window.savePayDebt = async function(id) {
         });
       }
     }
-    toast('Pembayaran dicatat'); closeModal(); renderPage();
+    const stillRemaining = d.amount - newPaid;
+    if (stillRemaining <= 0) toast(`🎉 ${d.type==='hutang'?'Hutang':'Piutang'} dengan ${d.person} LUNAS! Dipindah ke Riwayat.`, 'success');
+    else toast('Pembayaran dicatat');
+    closeModal(); renderPage();
   } catch(e) { toast('Gagal: '+e.message,'error'); if(btn){btn.disabled=false;btn.textContent='Simpan';} }
 };
 
