@@ -19,7 +19,8 @@ service cloud.firestore {
         && (!('note' in d) || (d.note is string && d.note.size() <= 300))
         && (!('transferId' in d) || d.transferId is string)
         && (!('flow' in d) || d.flow in ['real','hutang','transfer'])
-        && (!('debtId' in d) || d.debtId is string);
+        && (!('debtId' in d) || d.debtId is string)
+        && (!('debtRole' in d) || d.debtRole in ['disburse','payment','interest']);
     }
 
     // ── Validasi skema ANGGARAN ──
@@ -34,8 +35,8 @@ service cloud.firestore {
     function isValidGoal(d) {
       return d.keys().hasAll(['name','target','current','deadline','icon','color'])
         && d.name is string && d.name.size() > 0 && d.name.size() <= 60
-        && d.target  is number && d.target  >= 0
-        && d.current is number && d.current >= 0
+        && d.target  is number && d.target  >= 0 && d.target  < 999999999999
+        && d.current is number && d.current >= 0 && d.current < 999999999999
         && d.deadline is string
         && d.icon  is string
         && d.color is string
@@ -72,6 +73,7 @@ service cloud.firestore {
         && (!('person' in d)   || (d.person is string && d.person.size() > 0 && d.person.size() <= 60))
         && (!('amount' in d)   || (d.amount is number && d.amount > 0 && d.amount < 999999999999))
         && (!('paid' in d)     || (d.paid is number && d.paid >= 0 && d.paid < 999999999999))
+        && (!('paid' in d) || !('amount' in d) || d.paid <= d.amount)
         && (!('borrowDate' in d) || d.borrowDate is string)
         && (!('dueDate' in d)  || d.dueDate == null || d.dueDate is string)
         && (!('note' in d)     || (d.note is string && d.note.size() <= 200))
@@ -97,6 +99,13 @@ service cloud.firestore {
         && (!('schedules' in d)        || d.schedules is map)
         && (!('overrides' in d)        || d.overrides is map)
         && (!('completedBlocks' in d)  || d.completedBlocks is map);
+    }
+
+    // ── Validasi PENGATURAN ──
+    function isValidSettings(d) {
+      return (!('theme' in d)        || d.theme in ['dark','light'])
+        && (!('currency' in d)       || d.currency in ['Rp','$','€','¥','£'])
+        && (!('wealthLadder' in d)   || d.wealthLadder is map);
     }
 
     match /users/{userId} {
@@ -133,20 +142,27 @@ service cloud.firestore {
 
       match /debts/{debtId} {
         allow read:          if isOwner(userId);
-        allow create, update:if isOwner(userId) && isValidDebt(request.resource.data);
+        // create wajib lengkap; update boleh parsial (mis. hanya {paid}) tapi hasil akhirnya tetap divalidasi
+        allow create:        if isOwner(userId) && isValidDebt(request.resource.data)
+                                && request.resource.data.keys().hasAll(['type','person','amount','paid']);
+        allow update:        if isOwner(userId) && isValidDebt(request.resource.data);
         allow delete:        if isOwner(userId);
       }
 
       match /targets/{targetId} {
         allow read:          if isOwner(userId);
-        allow create, update:if isOwner(userId) && isValidTarget(request.resource.data);
+        allow create:        if isOwner(userId) && isValidTarget(request.resource.data)
+                                && request.resource.data.keys().hasAll(['period','mode','title']);
+        allow update:        if isOwner(userId) && isValidTarget(request.resource.data);
         allow delete:        if isOwner(userId);
       }
 
-      // Settings: { theme, currency, wealthLadder:{...} } — semuanya preferensi/status
-      // pribadi non-sensitif, risiko rendah, cukup cek kepemilikan (bukan data finansial inti).
+      // Settings: { theme, currency, wealthLadder:{...} } — preferensi/status pribadi.
+      // Dibatasi nilainya agar dokumen ini tidak bisa dipakai menyimpan data sembarang.
       match /settings/{settingId} {
-        allow read, write: if isOwner(userId);
+        allow read:          if isOwner(userId);
+        allow create, update:if isOwner(userId) && isValidSettings(request.resource.data);
+        allow delete:        if isOwner(userId);
       }
     }
 

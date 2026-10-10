@@ -23,3 +23,6 @@ firestore-debug.log
 
 # Archives
 *.zip
+
+# Hasil build tes
+tests/app.test.mjs

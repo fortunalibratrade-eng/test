@@ -202,7 +202,7 @@ select.form-input option{background:var(--bg2)}
   border-bottom:1px solid var(--border);cursor:pointer;
   transition:background .2s;
 }
-.sidebar-user:hover{background:rgba(var(--acc),0.05)}
+.sidebar-user:hover{background:var(--acc-l)}
 .user-avatar{
   width:34px;height:34px;border-radius:50%;
   background:linear-gradient(135deg,var(--acc),var(--acc-d));
@@ -229,7 +229,7 @@ select.form-input option{background:var(--bg2)}
   border:1px solid var(--border);box-shadow:var(--neu-raised);
   transition:box-shadow .25s,border-color .25s;
 }
-.card:hover{box-shadow:10px 10px 22px var(--sh-d),-10px -10px 22px var(--sh-l);border-color:rgba(var(--acc),0.2)}
+.card:hover{box-shadow:10px 10px 22px var(--sh-d),-10px -10px 22px var(--sh-l);border-color:var(--acc-l)}
 .grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
 .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
@@ -368,6 +368,7 @@ select.form-input option{background:var(--bg2)}
 #hamburger{display:none}
 #sidebar-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:45;display:none}
 
+.notif-dot.hidden{display:none}
 .notif-dot{
   position:absolute;top:6px;right:6px;width:8px;height:8px;border-radius:50%;
   background:var(--expense);border:2px solid var(--bg);
@@ -1019,3 +1020,18 @@ select.form-input option{background:var(--bg2)}
   .topbar-right{ gap:6px!important; }
   .topbar-right .btn-primary span{ display:none; } /* ikon + saja, teks "Transaksi" disembunyikan */
 }
+
+/* ═══════════════════════════════════════════
+   CHIP FILTER (halaman Transaksi) & tombol nonaktif
+═══════════════════════════════════════════ */
+.chip{
+  display:inline-flex;align-items:center;gap:8px;padding:6px 8px 6px 13px;border-radius:20px;
+  font-size:12px;font-weight:600;color:var(--acc);background:var(--acc-l);
+  box-shadow:var(--neu-pressed-sm);
+}
+.chip button{
+  width:20px;height:20px;border-radius:50%;border:none;cursor:pointer;
+  background:transparent;color:var(--acc);display:inline-flex;align-items:center;justify-content:center;font-size:10px;
+}
+.chip button:hover{background:var(--acc);color:#fff}
+.btn:disabled,.type-toggle button:disabled,.form-input:disabled{opacity:.55;cursor:not-allowed}
