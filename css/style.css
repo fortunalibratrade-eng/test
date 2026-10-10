@@ -1035,3 +1035,14 @@ select.form-input option{background:var(--bg2)}
 }
 .chip button:hover{background:var(--acc);color:#fff}
 .btn:disabled,.type-toggle button:disabled,.form-input:disabled{opacity:.55;cursor:not-allowed}
+
+/* Dana pinjaman/piutang di Kalender (arus kas non-riil, dibedakan dari pemasukan/pengeluaran) */
+.cal-debt-pill{
+  font-size:9px;font-weight:700;color:var(--gold);
+  background:var(--gold-l);border-radius:5px;
+  padding:2px 5px;margin-top:3px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  display:flex;align-items:center;gap:2px;
+  border-left:2px solid var(--gold);
+}
+@media(max-width:768px){ .cal-debt-pill{display:none} }

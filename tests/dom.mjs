@@ -13,9 +13,9 @@ globalThis.document = {
   createElement: () => mk('new'), querySelector: () => null, querySelectorAll: () => [], addEventListener(){},
   body: mk('body'), documentElement: { setAttribute(){}, getAttribute(){ return 'dark' } }, activeElement: { tagName:'BODY' }
 };
-globalThis.getComputedStyle = () => ({ getPropertyValue: () => '#7B9EF8' });
+globalThis.getComputedStyle = () => ({ getPropertyValue: n => ({'--income':'#3DDBA0','--expense':'#FF7068'}[n] || '#7B9EF8') });
 globalThis.requestAnimationFrame = () => 0;
-globalThis.localStorage = { _d:{}, getItem(k){return this._d[k]??null}, setItem(k,v){this._d[k]=v} };
+globalThis.localStorage = { _d:{}, getItem(k){return this._d[k]??null}, setItem(k,v){this._d[k]=String(v)}, removeItem(k){delete this._d[k]}, key(i){return Object.keys(this._d)[i]??null}, get length(){return Object.keys(this._d).length}, clear(){this._d={}} };
 const _si = globalThis.setInterval; globalThis.setInterval = () => 0; globalThis.clearInterval = () => {};
 globalThis.fetch = async () => { throw new Error('offline'); };
 export const $ = id => document.getElementById(id);

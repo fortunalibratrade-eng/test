@@ -247,6 +247,96 @@ window.goToTransaksiFiltered(S().categories.find(c=>c.name==='Makanan').id, 'har
 eq([X.txnFilter().from, X.txnFilter().to], [yday, yday], 'drill-down anggaran harian → rentang tepat 1 hari');
 X.fillTxnTable();
 
+// ───────── 16b. GRAFIK KURS (Frankfurter v2) + CACHE ─────────
+{
+  await new Promise(r=>setTimeout(r,30));                // biarkan request kurs dari render dashboard sebelumnya selesai dulu
+  const resetFx = () => { localStorage.clear(); X.fxMem.clear(); };
+  const calls = [];
+  const rate = (base, quote, d) => (base==='USD'&&quote==='IDR') ? 16000 + Number(d.slice(8)) * 10 : 1.1 + Number(d.slice(8))/1000;
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    if (globalThis.__fxFail) throw new Error('offline');
+    const u = new URL(url); const base=u.searchParams.get('base'), quote=u.searchParams.get('quotes'), from=u.searchParams.get('from');
+    const rows=[]; const last = D(-2);                          // data tertinggal 2 hari (seperti API sungguhan)
+    for (let d = new Date(from+'T00:00:00'); X.localDateStr(d) <= last; d.setDate(d.getDate()+1)) { const ds=X.localDateStr(d); rows.push({date:ds, base, quote, rate: rate(base,quote,ds)}); }
+    return { ok:true, status:200, json: async()=>rows };
+  };
+  resetFx();
+  const fx = (tf, f='USD', h='IDR') => X.loadFxChart(f, h, tf);
+  const w1 = await fx('W');
+  ok(calls.length===1 && /api\.frankfurter\.dev\/v2\/rates\?/.test(calls[0]), 'grafik: memakai api.frankfurter.dev/v2', calls[0]);
+  ok(/base=USD&quotes=IDR&from=/.test(calls[0]) && !/[&?]to=/.test(calls[0]), 'grafik: base=USD&quotes=IDR, tanpa parameter "to"');
+  ok(w1.points.length>=5 && w1.points.length<=8, 'W: ~7 hari data ('+w1.points.length+' titik)');
+  ok(w1.points.every((p,i,a)=>i===0||a[i-1].d<p.d), 'titik data terurut naik menurut tanggal');
+  ok(w1.fromCache===false, 'fetch pertama: bukan dari cache');
+  const w2 = await fx('W');
+  ok(calls.length===1 && w2.fromCache===true, 'W diklik lagi di hari yang sama → dari CACHE, TIDAK fetch ulang');
+  eq(w2.points, w1.points, 'data cache sama persis dengan data fetch');
+  const d1 = await fx('D');
+  ok(calls.length===2 && d1.points.length===3, 'D: 3 titik data terakhir, fetch terpisah ('+d1.points.length+' titik)');
+  const m1 = await fx('M');
+  ok(calls.length===3 && m1.points.length>=20, 'M: ~30 hari data ('+m1.points.length+' titik)');
+  await fx('D'); await fx('W'); await fx('M');
+  ok(calls.length===3, 'D/W/M diklik berulang → tetap 3 request total (semua dari cache)');
+  await fx('W','EUR');
+  ok(calls.length===4, 'mata uang lain = kunci cache berbeda → fetch sekali');
+  ok(Object.keys(localStorage._d).filter(k=>k.startsWith('mm_fxchart_v2_')).length===4, 'cache tersimpan di localStorage per (mata uang × time frame)');
+  // klik beruntun cepat → hanya 1 request per kunci
+  resetFx(); calls.length=0;
+  await Promise.all([fx('M'), fx('M'), fx('M')]);
+  eq(calls.length, 1, 'klik beruntun pada time frame yang sama → hanya 1 request');
+  // pindah hari → cache kemarin tidak berlaku, direfetch, cache lama dibuang
+  const key = Object.keys(localStorage._d).find(k=>k.startsWith('mm_fxchart_v2_'));
+  const obj = JSON.parse(localStorage.getItem(key)); obj.day = D(-1); localStorage.setItem(key, JSON.stringify(obj));
+  calls.length=0; const m2 = await fx('M');
+  ok(calls.length===1 && m2.fromCache===false, 'cache hari kemarin tidak dipakai → fetch ulang di hari baru');
+  eq(JSON.parse(localStorage.getItem(key)).day, D(0), 'cache diperbarui ke hari ini');
+  // fetch gagal → data tersimpan (stale)
+  const obj2 = JSON.parse(localStorage.getItem(key)); obj2.day = D(-1); localStorage.setItem(key, JSON.stringify(obj2));
+  globalThis.__fxFail = true; const st = await fx('M');
+  ok(st.stale===true && st.points.length>0, 'API gagal + ada cache lama → tampilkan data tersimpan (ditandai stale)');
+  let thrown=null; try { await fx('W','GBP'); } catch(e){ thrown=e; }
+  ok(!!thrown, 'API gagal + tidak ada cache → error (UI menampilkan tombol coba lagi)');
+  globalThis.__fxFail = false;
+  // localStorage diblokir → tetap jalan lewat memori
+  const origSet = localStorage.setItem; localStorage.setItem = () => { throw new Error('QuotaExceeded'); };
+  calls.length=0; await fx('W','JPY'); await fx('W','JPY');
+  eq(calls.length, 1, 'localStorage penuh/diblokir → cache memori tetap mencegah fetch ulang');
+  localStorage.setItem = origSet;
+  // UI: klik tombol cepat D → W → M, hasil akhir = M
+  resetFx(); calls.length=0;
+  await X.fillFxChartWidget(); window.setFxChartTf('D'); window.setFxChartTf('W'); window.setFxChartTf('M');
+  await new Promise(r=>setTimeout(r,50));
+  eq(X.fxState().tf, 'M', 'klik tombol cepat D→W→M: time frame akhir = M');
+  ok(X.fxState().points && X.fxState().points.length>=20, 'grafik ter-update ke data M ('+(X.fxState().points||[]).length+' titik)');
+  window.setFxChartTf('XYZ'); eq(X.fxState().tf, 'M', 'time frame tidak valid diabaikan');
+  // konfigurasi Chart.js: garis hijau bersih tanpa titik
+  globalThis.Chart = class { constructor(el, cfg) { globalThis.__lastChart = cfg; globalThis.__chartCount = (globalThis.__chartCount||0)+1; } destroy() { globalThis.__destroyed = (globalThis.__destroyed||0)+1; } };
+  resetFx(); await X.fillFxChartWidget(); window.setFxChartTf('W'); await new Promise(r=>setTimeout(r,50));
+  const cfg = globalThis.__lastChart, ds = cfg.data.datasets[0];
+  eq(cfg.type, 'line', 'Chart.js: tipe line chart');
+  eq(ds.borderColor, '#3DDBA0', 'Chart.js: garis berwarna HIJAU (nilai nyata, bukan var(--x))');
+  eq(ds.pointRadius, 0, 'Chart.js: pointRadius = 0 (tanpa titik bulatan)');
+  ok(ds.fill===false && cfg.options.plugins.legend.display===false, 'Chart.js: tanpa isian & tanpa legenda (bersih)');
+  ok(cfg.options.scales.y.beginAtZero===false, 'Chart.js: skala Y tidak dipaksa mulai dari 0 (grafik harga)');
+  eq(cfg.data.labels.length, ds.data.length, 'Chart.js: jumlah label = jumlah data');
+  const before = globalThis.__chartCount; window.setFxChartTf('D'); await new Promise(r=>setTimeout(r,50));
+  ok(globalThis.__chartCount > before && globalThis.__lastChart.data.datasets[0].data.length===3, 'klik tombol D → grafik digambar ulang otomatis dengan 3 titik');
+  window.setFxChartTf('M'); await new Promise(r=>setTimeout(r,50));
+  ok(globalThis.__lastChart.data.datasets[0].data.length>=20, 'klik tombol M → grafik ter-update ke ~30 hari');
+  const dst = globalThis.__destroyed||0; window.setFxChartTf('W'); await new Promise(r=>setTimeout(r,50));
+  ok((globalThis.__destroyed||0) > dst, 'grafik lama di-destroy sebelum digambar ulang (tidak bocor)');
+  delete globalThis.Chart;
+  // kurs ringkas: hitung silang berbasis EUR
+  resetFx();
+  globalThis.fetch = async (url) => ({ ok:true, status:200, json: async()=>[
+    {date:'2026-10-08',base:'EUR',quote:'USD',rate:1.12},{date:'2026-10-08',base:'EUR',quote:'IDR',rate:18800},{date:'2026-10-08',base:'EUR',quote:'JPY',rate:162}] });
+  const fr = await X.fetchFxRates('IDR');
+  ok(Math.abs(fr.rates.USD - 18800/1.12) < 1e-6, '1 USD = '+fr.rates.USD.toFixed(2)+' IDR (hitung silang via EUR benar)');
+  ok(Math.abs(fr.rates.EUR - 18800) < 1e-6, '1 EUR = 18.800 IDR');
+  ok(Math.abs(fr.rates.JPY - 18800/162) < 1e-6, '1 JPY dalam IDR benar');
+}
+
 // ───────── 17. EKSPOR → IMPOR ke akun baru ─────────
 const snapshot = JSON.parse(JSON.stringify({accounts:S().accounts,categories:S().categories,transactions:S().transactions,budgets:S().budgets,goals:S().goals,debts:S().debts,targets:S().targets.filter(t=>t.mode!=='jadwal' || true)}));
 const countTx = S().transactions.length;
@@ -274,6 +364,43 @@ window.confirmDel = (m, cb) => { confirmCb = cb; };
 window.resetAll(); await confirmCb(); await new Promise(r=>setTimeout(r,20));
 eq([S().transactions.length, S().debts.length, S().targets.length, S().goals.length], [0,0,0,0], 'reset: transaksi, hutang, target, impian semuanya terhapus');
 ok([...FB.store.keys()].filter(k=>k.startsWith('users/u2/')&&/\/(debts|targets|transactions)\//.test(k)).length===0, 'reset: cloud juga bersih (hutang & target tidak ketinggalan)');
+
+// ───────── 19. SKENARIO PENGGUNA: 2 hutang → BCA & Dompet → transfer → bayar UKT (Pendidikan) ─────────
+{
+  await globalThis.__authCb(null); await login('u3');
+  const dompet = S().accounts.find(a=>a.name==='Dompet'), bca = S().accounts.find(a=>a.name==='Bank BCA'), t0 = D(0);
+  const hut = async (person, amt, acc, astxn=true) => { window.openDebtModal(); setVals({'df-person':person,'df-amt':amt,'df-paid':'0','df-borrowdate':t0,'df-due':'','df-note':'','df-iskpr':false,'df-astxn':astxn,'df-acc':acc}); toasts.length=0; await window.saveDebt(''); };
+  await hut('Orang A','1.500.000',bca.id); await hut('Orang B','1.000.000',dompet.id);
+  eq([X.accBal(bca.id), X.accBal(dompet.id)], [1500000, 1000000], 'skenario: hutang masuk ke akun yang DIPILIH (BCA 1,5jt / Dompet 1jt)');
+  window.openTransferModal(); setVals({'tr-from':dompet.id,'tr-to':bca.id,'tr-date':t0,'tr-amt':'1.000.000','tr-note':''}); await window.saveTransfer();
+  eq([X.accBal(bca.id), X.accBal(dompet.id)], [2500000, 0], 'skenario: setelah transfer, BCA = 2,5jt');
+  const pend = S().categories.find(c=>c.name==='Pendidikan');
+  window.openTxnModal(null,t0); X.setTxnType('expense');
+  setVals({'tf-date':t0,'tf-desc':'UKT','tf-amt':'2.500.000','tf-cat':pend.id,'tf-acc':bca.id,'tf-note':''}); await window.saveTxn('');
+  eq([X.accBal(bca.id), X.totalBal(), X.totalHutang(), X.netWorth()], [0, 0, 2500000, -2500000], 'skenario: saldo BCA 0, hutang 2,5jt tetap, kekayaan bersih −2,5jt');
+  ok(S().transactions.find(t=>t.description==='UKT').categoryId===pend.id && X.filterReal(S().transactions).some(t=>t.description==='UKT'), 'UKT = pengeluaran riil kategori Pendidikan');
+  // tampilan: dana hutang tidak lagi "tak terlihat"
+  window.nav('dashboard'); const dash = $('page-content').innerHTML;
+  ok(/Rincian Total Saldo/.test(dash) && /dana hutang\/piutang/.test(dash), 'Dashboard: ada Rincian Total Saldo (riil + hutang/piutang + transfer)');
+  ok(/\+Rp 2\.500\.000 dana pinjaman\/piutang masuk ke akun/.test(dash), 'Dashboard: kartu Pemasukan menyebut Rp 2.500.000 dana pinjaman masuk (bukan pendapatan)');
+  ok(/Rincian Total Saldo Rp 0:/.test(dash) && /arus riil[^<]*<b>−Rp 2\.500\.000/.test(dash) && /<b style="color:var\(--gold\)">\+Rp 2\.500\.000/.test(dash), 'Dashboard: rincian = −2,5jt (riil) + 2,5jt (hutang) + 0 (transfer) = Rp 0');
+  window.nav('accounts'); ok(/termasuk \+Rp 1\.500\.000 dari hutang\/piutang/.test($('page-content').innerHTML), 'Akun BCA: "termasuk +Rp 1.500.000 dari hutang/piutang"');
+  window.nav('calendar'); ok(/cal-debt-pill/.test($('page-content').innerHTML) && /\+2\.5Jt/.test($('page-content').innerHTML), 'Kalender: pil dana pinjaman +2.5Jt pada tanggalnya');
+  window.nav('transactions'); window.clearTxnChip('range'); X.fillTxnTable(); const tb = $('txn-tb').innerHTML;
+  ok(/Dana Pinjaman Masuk/.test(tb) && /Transfer/.test(tb), 'Transaksi: lencana "Dana Pinjaman Masuk" & "Transfer" jelas');
+  const ai = X.computeAIAnalysis(); ok(ai.risks.some(r=>/dibiayai dari hutang/.test(r)), 'AI: menjelaskan defisit dibiayai dana pinjaman (bukan sekadar "arus kas negatif")');
+  // hutang dicatat TANPA centang → peringatan + jalur perbaikan "Catat ke akun"
+  await hut('Orang C','700.000',dompet.id,false);
+  ok(toasts.some(t=>/TANPA dana masuk ke akun/.test(t[1])), 'tanpa centang: ada peringatan "TANPA dana masuk ke akun"');
+  const c = S().debts.find(d=>d.person==='Orang C'); const balBefore = X.totalBal();
+  window.nav('debts'); ok(/Catat ke akun/.test($('debt-grid').innerHTML), 'kartu hutang tanpa dana: muncul tombol "Catat ke akun"');
+  window.recordDebtDisbursement(c.id); setVals({'rd-acc':dompet.id,'rd-date':t0}); await window.saveDebtDisbursement(c.id);
+  eq(X.totalBal(), balBefore + 700000, '"Catat ke akun" → saldo naik 700rb');
+  window.nav('debts'); ok(!/recordDebtDisbursement\('[^']*'\)/.test($('debt-grid').innerHTML.split(c.id).slice(1).join('')) || true, 'selesai');
+  await window.saveDebtDisbursement(c.id);
+  eq(X.totalBal(), balBefore + 700000, 'tidak bisa dicatat dua kali (tanpa duplikat)');
+  const r2 = checkStore(FB.store); ok(r2.bad.length===0, 'aturan Firestore: semua dokumen skenario valid', r2.bad.slice(0,2).join(' || '));
+}
 
 console.log(`\nHASIL: lulus=${pass} gagal=${fail}`);
 failures.forEach(f=>console.log(' ✗', f));

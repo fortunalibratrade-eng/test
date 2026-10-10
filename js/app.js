@@ -207,19 +207,30 @@ const FX_MAJORS = ['USD','EUR','GBP','JPY','SGD','AUD','MYR','CNY'];
 let _fxCache = null;
 // Cache di localStorage 6 jam supaya hemat kuota API & tetap tampil (walau agak basi) kalau offline/API down.
 // Provider 1: Frankfurter (ECB). Base bisa currency apapun krn dihitung cross-rate via EUR.
+async function fetchWithTimeout(url, ms = 10000) {
+  const ctrl = new AbortController(), tm = setTimeout(() => ctrl.abort(), ms);
+  try { return await fetch(url, { signal: ctrl.signal }); } finally { clearTimeout(tm); }
+}
 async function fetchFxFromFrankfurter(baseIso) {
-  const symbols = FX_MAJORS.filter(c=>c!==baseIso).join(',');
-  const res = await fetch(`https://api.frankfurter.app/latest?from=${baseIso}&to=${symbols}`);
-  if (!res.ok) throw new Error('Frankfurter HTTP '+res.status);
-  const data = await res.json();
+  // API v2 (https://api.frankfurter.dev/v2/rates): array datar {date, base, quote, rate}.
+  // Basis EUR dipakai karena kurs EUR→X punya angka bermakna paling banyak untuk SEMUA mata uang (IDR, JPY, dll),
+  // lalu dihitung silang ke mata uang dasar pilihan user — hanya 1 request.
+  const wanted = [...new Set([...FX_MAJORS, baseIso])].filter(c => c !== 'EUR');
+  const res = await fetchWithTimeout(`https://api.frankfurter.dev/v2/rates?base=EUR&quotes=${wanted.join(',')}`);
+  if (!res.ok) throw new Error('Frankfurter HTTP ' + res.status);
+  const rows = await res.json();
+  if (!Array.isArray(rows)) throw new Error('Frankfurter: format respons tak dikenal');
+  const eur = { EUR: 1 }; let date = null;
+  rows.forEach(r => { if (r && r.rate > 0) { eur[r.quote] = r.rate; if (!date || r.date > date) date = r.date; } });
+  if (!(eur[baseIso] > 0)) throw new Error('Frankfurter: kurs mata uang dasar tidak tersedia');
   const rates = {};
-  Object.entries(data.rates||{}).forEach(([k,v]) => { if (v>0) rates[k] = 1/v; }); // invert: "1 IDR=0.00006 USD" → "1 USD=X IDR"
+  FX_MAJORS.forEach(c => { if (c !== baseIso && eur[c] > 0) rates[c] = eur[baseIso] / eur[c]; });   // 1 c = berapa baseIso
   if (!Object.keys(rates).length) throw new Error('Frankfurter: data kosong');
-  return { rates, date: data.date };
+  return { rates, date };
 }
 // Provider 2 (cadangan kalau provider 1 down/limit): open.er-api.com — juga gratis, tanpa API key.
 async function fetchFxFromErApi(baseIso) {
-  const res = await fetch(`https://open.er-api.com/v6/latest/${baseIso}`);
+  const res = await fetchWithTimeout(`https://open.er-api.com/v6/latest/${baseIso}`);
   if (!res.ok) throw new Error('ER-API HTTP '+res.status);
   const data = await res.json();
   if (data.result !== 'success') throw new Error('ER-API: respons gagal');
@@ -232,7 +243,7 @@ async function fetchFxFromErApi(baseIso) {
 // Cache 6 jam di localStorage + 2 provider berurutan, supaya kurs SELALU berhasil tampil
 // kecuali keduanya down bersamaan DAN belum pernah berhasil fetch sebelumnya di device ini.
 async function fetchFxRates(baseIso) {
-  const cacheKey = 'mm_fx_' + baseIso;
+  const cacheKey = 'mm_fx2_' + baseIso;   // v2: cache lama (hasil inversi kurang presisi) tidak dipakai lagi
   let cached = null;
   try { cached = JSON.parse(localStorage.getItem(cacheKey) || 'null'); } catch(e) {}
   if (cached && (Date.now() - cached.fetchedAt) < 6*3600*1000) { _fxCache = cached; return cached; }
@@ -1077,6 +1088,15 @@ async function commitPlan(plan) {
     setSyncDot('ok');
   } catch(e) { setSyncDot('error'); throw e; }
 }
+// Label manusiawi utk transaksi arus-kas non-riil (muncul sbg lencana di Transaksi & Kalender)
+function debtFlowLabel(t) {
+  if (t.flow === 'transfer') return 'Transfer';
+  const role = txnDebtRole(t);
+  const d = role ? S.debts.find(x => x.id === t.debtId) : null;
+  if (role === 'payment') { const h = d ? d.type === 'hutang' : t.type === 'expense'; return h ? 'Bayar Hutang' : 'Terima Piutang'; }
+  const h = d ? d.type === 'hutang' : t.type === 'income';
+  return h ? 'Dana Pinjaman Masuk' : 'Beri Pinjaman';
+}
 // Peran sebuah transaksi terhadap catatan hutang/piutang:
 //  'disburse' = pencairan awal (terima pinjaman / beri pinjaman)   → tidak mengubah sisa hutang
 //  'payment'  = cicilan/pelunasan pokok                             → mengurangi sisa hutang
@@ -1371,6 +1391,7 @@ function computeAIAnalysis() {
   const overdueDebts = S.debts.filter(d => d.dueDate && d.dueDate < today() && debtRemaining(d) > 0);
   // KPR (cicilan jangka panjang) dikecualikan dari rasio beban hutang — kalau tidak, pemilik KPR selalu kena penalti & peringatan palsu.
   const hutangKecil = S.debts.filter(d=>d.type==='hutang' && !d.isKPR).reduce((s,d)=>s+debtRemaining(d),0);
+  const debtInMonth = sumType(monthTxns(0).filter(t => t.flow === 'hutang'), 'income');   // dana pinjaman yg masuk akun bulan ini (bukan pendapatan)
   const debtToIncomeRatio = inc > 0 ? hutangKecil/inc : (hutangKecil>0 ? 2 : 0);
 
   const now = new Date();
@@ -1415,7 +1436,7 @@ function computeAIAnalysis() {
   }
 
   if (savingsRate >= 0.2) strengths.push(`Tingkat tabungan sehat: ${(savingsRate*100).toFixed(1)}% dari pemasukan bulan ini berhasil disisihkan.`);
-  else if (savingsRate < 0) risks.push(`Pengeluaran melebihi pemasukan bulan ini sebesar ${fmt(Math.abs(inc-exp))}. Arus kas negatif perlu segera dikoreksi.`);
+  else if (savingsRate < 0) risks.push(`Pengeluaran riil melebihi pemasukan riil bulan ini sebesar ${fmt(Math.abs(inc-exp))}.` + (debtInMonth > 0 ? ` Dana pinjaman ${fmt(debtInMonth)} yang masuk ke akun TIDAK dihitung sebagai pemasukan — pengeluaran ini dibiayai dari hutang, bukan dari penghasilan.` : ' Arus kas negatif perlu segera dikoreksi.'));
   else if (savingsRate < 0.1) risks.push(`Tingkat tabungan rendah (${(savingsRate*100).toFixed(1)}%). Idealnya minimal 20% dari pemasukan disisihkan.`);
 
   if (overBudgetCats.length) {
@@ -1453,7 +1474,7 @@ function computeAIAnalysis() {
   return {
     score, grade, gradeColor, summary,
     savingsRate, inc, exp, projectedExp, totalBudget,
-    hutang, hutangKecil, piutang, overdueDebts, debtToIncomeRatio,
+    hutang, hutangKecil, piutang, overdueDebts, debtToIncomeRatio, debtInMonth,
     strengths: strengths.slice(0,4), risks: risks.slice(0,4), tips: tips.slice(0,3)
   };
 }
@@ -1553,7 +1574,7 @@ function computeFullAIReport() {
   if (base.savingsRate < 0) {
     const deficit = Math.abs(base.inc - base.exp);
     priorities.push({ level:'urgent', icon:'fa-circle-exclamation',
-      problem: `Pengeluaran riil (${fmt(base.exp)}) melebihi pendapatan (${fmt(base.inc)}) bulan ini — minus ${fmt(deficit)}.`,
+      problem: `Pengeluaran riil (${fmt(base.exp)}) melebihi pendapatan (${fmt(base.inc)}) bulan ini — minus ${fmt(deficit)}.` + (base.debtInMonth > 0 ? ` Selisih ini tertutup oleh dana pinjaman ${fmt(base.debtInMonth)} yang masuk ke akun (bukan pendapatan), sehingga beban hutang Anda bertambah.` : ''),
       solutions: [
         topCat ? `Audit kategori pengeluaran terbesar Anda ("${esc(topCat[0])}", ${fmt(topCat[1])}) dan pangkas yang tidak esensial.` : 'Audit kategori pengeluaran terbesar dan pangkas yang tidak esensial.',
         'Cari tambahan pendapatan jangka pendek untuk menutup selisihnya.',
@@ -1694,6 +1715,174 @@ async function fillSettingsFxPreview() {
     <div style="margin-top:4px"><a href="#" onclick="nav('dashboard');return false" style="color:var(--acc);font-size:11px">Lihat semua kurs di Dashboard →</a></div>`;
 }
 
+/* ═══════════════════════════════════════════
+   GRAFIK KURS (Frankfurter API v2 — tanpa API key, front-end only)
+   • Garis HIJAU bersih, tanpa titik (pointRadius:0), tooltip muncul saat disorot.
+   • Time frame: D = 3 hari data terakhir, W = 7 hari, M = 30 hari. Klik tombol → grafik langsung ter-update.
+   • CACHE: kombinasi (mata uang, time frame) yang sama pada HARI YANG SAMA dibaca dari localStorage — tidak fetch ulang.
+     Cache hari sebelumnya dibuang otomatis. Kalau fetch gagal, data tersimpan terakhir ditampilkan (diberi tanda).
+   • Arah kurs: "1 USD = Rp x" (seperti grafik di mesin pencari). Diambil dengan base=USD&quotes=IDR supaya angkanya
+     presisi — kebalikannya (base=IDR) hanya ~0,00006 per rupiah sehingga angka bermaknanya sedikit. Ubah
+     FX_CHART_HOME_AS_BASE ke true bila ingin memakai base=IDR persis (hasilnya otomatis dibalik agar tampilan sama).
+═══════════════════════════════════════════ */
+const FX_CHART_HOME_AS_BASE = false;
+const FX_CHART_TF = {
+  D: { days: 6,  keep: 3,    title: '3 hari terakhir' },    // ambil 6 hari ke belakang, tampilkan 3 titik data terakhir (data bisa tertinggal 1-2 hari)
+  W: { days: 7,  keep: null, title: '7 hari terakhir' },
+  M: { days: 30, keep: null, title: '30 hari terakhir' }
+};
+const FX_CHART_PREFIX = 'mm_fxchart_v2_';
+const _fxChartMem = new Map();        // cadangan bila localStorage diblokir (mode privat)
+const _fxChartInflight = new Map();   // satu request per kunci (klik cepat tidak menumpuk request)
+const _fxChartState = { foreign: 'USD', tf: 'W', points: null, meta: null, token: 0 };
+
+const fxChartKey = (foreign, home, tf) => `${FX_CHART_PREFIX}${foreign}_${home}_${tf}`;
+function fxCacheRead(key) {
+  try { const raw = JSON.parse(localStorage.getItem(key) || 'null'); if (raw && Array.isArray(raw.points)) return raw; } catch(e) {}
+  return _fxChartMem.get(key) || null;
+}
+function fxCacheWrite(key, payload) {
+  _fxChartMem.set(key, payload);
+  try {
+    localStorage.setItem(key, JSON.stringify(payload));
+    // buang cache hari-hari sebelumnya supaya localStorage tidak menumpuk
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(FX_CHART_PREFIX)) { try { if (JSON.parse(localStorage.getItem(k)).day !== payload.day) localStorage.removeItem(k); } catch(e) { localStorage.removeItem(k); } }
+    }
+  } catch(e) { /* penyimpanan penuh/diblokir → cukup memori */ }
+}
+async function fetchFxChartSeries(foreign, home, tf) {
+  const cfg = FX_CHART_TF[tf];
+  const from = new Date(); from.setDate(from.getDate() - cfg.days);
+  const base = FX_CHART_HOME_AS_BASE ? home : foreign, quote = FX_CHART_HOME_AS_BASE ? foreign : home;
+  // tanpa parameter 'to' → sampai data terbaru (menghindari selisih tanggal UTC vs lokal)
+  const res = await fetchWithTimeout(`https://api.frankfurter.dev/v2/rates?base=${base}&quotes=${quote}&from=${localDateStr(from)}`);
+  if (!res.ok) throw new Error('Frankfurter HTTP ' + res.status);
+  const rows = await res.json();
+  if (!Array.isArray(rows)) throw new Error('format respons tak dikenal');
+  const byDate = new Map();
+  rows.forEach(r => { if (r && r.quote === quote && Number(r.rate) > 0 && /^\d{4}-\d{2}-\d{2}$/.test(r.date)) byDate.set(r.date, FX_CHART_HOME_AS_BASE ? 1 / Number(r.rate) : Number(r.rate)); });
+  let points = [...byDate.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([d, v]) => ({ d, v }));
+  if (cfg.keep) points = points.slice(-cfg.keep);
+  if (points.length < 2) throw new Error('data belum cukup untuk grafik');
+  return points;
+}
+// Cache hari ini → pakai. Kalau tidak ada → fetch. Fetch gagal → pakai cache lama (stale) bila ada.
+async function loadFxChart(foreign, home, tf) {
+  const key = fxChartKey(foreign, home, tf), day = today();
+  const cached = fxCacheRead(key);
+  if (cached && cached.day === day) return { points: cached.points, fromCache: true, stale: false, fetchedAt: cached.fetchedAt };
+  if (_fxChartInflight.has(key)) return _fxChartInflight.get(key);
+  const job = (async () => {
+    try {
+      const points = await fetchFxChartSeries(foreign, home, tf);
+      const payload = { day, fetchedAt: Date.now(), points };
+      fxCacheWrite(key, payload);
+      return { points, fromCache: false, stale: false, fetchedAt: payload.fetchedAt };
+    } catch (e) {
+      if (cached) return { points: cached.points, fromCache: true, stale: true, fetchedAt: cached.fetchedAt, error: e.message };
+      throw e;
+    } finally { _fxChartInflight.delete(key); }
+  })();
+  _fxChartInflight.set(key, job);
+  return job;
+}
+const fxHome = () => CUR_ISO[S.settings.currency || 'Rp'] || 'IDR';
+const fxSymbol = iso => (Object.entries(CUR_ISO).find(([, i]) => i === iso) || [iso])[0];
+function fxNum(v, iso) {
+  const d = v >= 1000 ? 0 : v >= 100 ? 2 : v >= 1 ? 4 : 6;
+  return fxSymbol(iso) + ' ' + Number(v).toLocaleString('id-ID', { maximumFractionDigits: d });
+}
+const fxForeignOptions = home => [...new Set([...FX_MAJORS, 'IDR'])].filter(c => c !== home);
+
+async function fillFxChartWidget() {
+  const wrap = document.getElementById('fx-chart-wrap'); if (!wrap) return;
+  const home = fxHome(), opts = fxForeignOptions(home);
+  if (!opts.includes(_fxChartState.foreign)) _fxChartState.foreign = opts[0];
+  wrap.innerHTML = `<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;margin-bottom:12px">
+      <div>
+        <h4 style="font-size:14px"><i class="fa-solid fa-chart-line" style="color:var(--income);margin-right:7px"></i>Grafik Kurs</h4>
+        <div id="fx-chart-now" style="font-family:'Outfit';font-size:22px;font-weight:800;margin-top:6px;min-height:28px">…</div>
+        <div id="fx-chart-chg" style="font-size:12px;font-weight:700;min-height:16px"></div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <select class="form-input" id="fx-chart-cur" style="width:auto;padding:8px 30px 8px 12px" onchange="setFxChartCurrency(this.value)">
+          ${opts.map(c => `<option value="${c}"${c === _fxChartState.foreign ? ' selected' : ''}>${c} → ${home}</option>`).join('')}
+        </select>
+        <div class="type-toggle" id="fx-chart-tf" style="min-width:150px">
+          ${Object.keys(FX_CHART_TF).map(k => `<button type="button" class="${k === _fxChartState.tf ? 'sel-active' : ''}" data-tf="${k}" title="${FX_CHART_TF[k].title}" onclick="setFxChartTf('${k}')">${k}</button>`).join('')}
+        </div>
+      </div>
+    </div>
+    <div class="chart-wrap" style="height:210px" id="fx-chart-box"><canvas id="fx-chart-canvas"></canvas></div>
+    <div id="fx-chart-note" style="font-size:10.5px;color:var(--txm);margin-top:8px">Memuat grafik…</div>
+  </div>`;
+  await refreshFxChart();
+}
+function updateFxChartControls() {
+  document.querySelectorAll('#fx-chart-tf button').forEach(b => b.classList.toggle('sel-active', b.dataset.tf === _fxChartState.tf));
+}
+async function refreshFxChart() {
+  const token = ++_fxChartState.token;
+  const home = fxHome(), foreign = _fxChartState.foreign, tf = _fxChartState.tf;
+  const note = () => document.getElementById('fx-chart-note');
+  if (note()) note().textContent = 'Memuat grafik…';
+  try {
+    const res = await loadFxChart(foreign, home, tf);
+    if (token !== _fxChartState.token || !document.getElementById('fx-chart-canvas')) return;   // klik lain/halaman berpindah
+    _fxChartState.points = res.points; _fxChartState.meta = { ...res, foreign, home, tf };
+    drawFxChart();
+    const pts = res.points, first = pts[0].v, last = pts[pts.length - 1].v, pct = (last - first) / first * 100;
+    const up = pct >= 0, col = up ? 'var(--income)' : 'var(--expense)';
+    document.getElementById('fx-chart-now').textContent = `1 ${foreign} = ${fxNum(last, home)}`;
+    const chg = document.getElementById('fx-chart-chg');
+    chg.style.color = col; chg.textContent = `${up ? '▲ +' : '▼ '}${pct.toFixed(2)}% · ${FX_CHART_TF[tf].title}`;
+    const D = { day: 'numeric', month: 'short', year: 'numeric' };
+    note().innerHTML = `Data per ${esc(fmtDate(pts[pts.length - 1].d, D))} · sumber Frankfurter (kurs harian, bisa tertinggal 1–2 hari) · ${res.stale ? '<span style="color:var(--gold)">⚠ gagal memuat terbaru, menampilkan data tersimpan</span>' : (res.fromCache ? 'dari cache hari ini (tanpa request baru)' : 'baru diambil')}`;
+  } catch (e) {
+    if (token !== _fxChartState.token || !document.getElementById('fx-chart-box')) return;
+    if (_charts.fx) { try { _charts.fx.destroy(); } catch(x) {} delete _charts.fx; }
+    _fxChartState.points = null;
+    document.getElementById('fx-chart-now').textContent = '—'; document.getElementById('fx-chart-chg').textContent = '';
+    note().innerHTML = `<i class="fa-solid fa-wifi"></i> Grafik belum bisa dimuat (${esc(e.message)}). <a href="#" onclick="refreshFxChart();return false" style="color:var(--acc)">Coba lagi</a>`;
+  }
+}
+function drawFxChart() {
+  const cv = document.getElementById('fx-chart-canvas'), pts = _fxChartState.points;
+  if (_charts.fx) { try { _charts.fx.destroy(); } catch(e) {} delete _charts.fx; }
+  if (!cv || !pts || typeof Chart === 'undefined') return;
+  const { foreign, home } = _fxChartState.meta || { foreign: _fxChartState.foreign, home: fxHome() };
+  const green = cssVar('--income');
+  const o = chartBaseOpts({ tooltipCallbacks: {
+    title: items => fmtDate(pts[items[0].dataIndex].d, { weekday: 'short', day: 'numeric', month: 'long', year: 'numeric' }),
+    label: ctx => `1 ${foreign} = ${fxNum(ctx.raw, home)}`
+  } });
+  o.plugins.legend.display = false;
+  o.interaction = { mode: 'index', intersect: false };
+  o.scales.x.ticks.maxTicksLimit = 6; o.scales.x.ticks.maxRotation = 0;
+  o.scales.y.beginAtZero = false;      // grafik harga: skala mengikuti pergerakan, bukan mulai dari 0
+  o.scales.y.grace = '10%';
+  o.scales.y.ticks.callback = v => Number(v).toLocaleString('id-ID', { maximumFractionDigits: v >= 1000 ? 0 : v >= 1 ? 3 : 5 });
+  _charts.fx = new Chart(cv, {
+    type: 'line',
+    data: { labels: pts.map(p => fmtDate(p.d, { day: 'numeric', month: 'short' })),
+      datasets: [{ label: `1 ${foreign} → ${home}`, data: pts.map(p => p.v), borderColor: green, backgroundColor: 'transparent',
+        borderWidth: 2.5, pointRadius: 0, pointHoverRadius: 4, pointHitRadius: 14, pointBackgroundColor: green, tension: 0.25, fill: false }] },
+    options: o
+  });
+}
+window.setFxChartTf = function(tf) {
+  if (!FX_CHART_TF[tf]) return;
+  _fxChartState.tf = tf; updateFxChartControls(); refreshFxChart();
+};
+window.setFxChartCurrency = function(c) {
+  if (!fxForeignOptions(fxHome()).includes(c)) return;
+  _fxChartState.foreign = c; refreshFxChart();
+};
+window.refreshFxChart = refreshFxChart;
+
 /* ── DASHBOARD ── */
 // Widget kurs: basis = mata uang pilihan user di Pengaturan. Async & aman gagal (tidak merusak dashboard).
 async function fillFxRatesWidget() {
@@ -1757,6 +1946,14 @@ function rDash(el) {
   const sr  = inc > 0 ? ((sav/inc)*100).toFixed(1) : 0;
   const bal = totalBal();
   const hutang = totalHutang(), piutang = totalPiutang(), nw = netWorth();
+  // Rekonsiliasi: Total Saldo = arus riil + arus hutang/piutang + transfer (transfer selalu 0 bersih) — supaya jelas ke mana setiap rupiah pergi
+  const netOf = arr => sumType(arr,'income') - sumType(arr,'expense');
+  const realNet = netOf(filterReal(S.transactions));
+  const debtNet = netOf(S.transactions.filter(t => t.flow === 'hutang'));
+  const trNet   = netOf(S.transactions.filter(t => t.flow === 'transfer'));
+  const flowM   = monthTxns(0).filter(t => t.flow === 'hutang');
+  const flowIn = sumType(flowM,'income'), flowOut = sumType(flowM,'expense');
+  const sg = v => (v >= 0 ? '+' : '') + fmt(v);
 
   const recent = [...S.transactions].sort((a,b) => new Date(b.date) - new Date(a.date)).slice(0, 7);
 
@@ -1773,12 +1970,14 @@ function rDash(el) {
       <div class="stat-label" style="margin-top:10px">Pemasukan Bulan Ini</div>
       <div class="stat-value" id="stat-inc" style="color:var(--income)">${fmt(0)}</div>
       <span class="stat-change ${inc>=li?'trend-up':'trend-down'}"><i class="fa-solid fa-arrow-${inc>=li?'up':'down'}"></i> ${li>0?Math.abs(((inc-li)/li)*100).toFixed(1):'0'}%</span>
+      ${flowIn>0?`<div style="font-size:10.5px;color:var(--gold);margin-top:7px;line-height:1.4"><i class="fa-solid fa-hand-holding-dollar"></i> +${fmt(flowIn)} dana pinjaman/piutang masuk ke akun <span style="color:var(--txm)">(bukan pendapatan, tidak dihitung di sini)</span></div>`:''}
     </div>
     <div class="card">
       <div class="stat-icon" style="background:var(--expense-l);color:var(--expense)"><i class="fa-solid fa-arrow-trend-down"></i></div>
       <div class="stat-label" style="margin-top:10px">Pengeluaran Bulan Ini</div>
       <div class="stat-value" id="stat-exp" style="color:var(--expense)">${fmt(0)}</div>
       <span class="stat-change ${exp<=le?'trend-up':'trend-down'}"><i class="fa-solid fa-arrow-${exp<=le?'down':'up'}"></i> ${le>0?Math.abs(((exp-le)/le)*100).toFixed(1):'0'}%</span>
+      ${flowOut>0?`<div style="font-size:10.5px;color:var(--gold);margin-top:7px;line-height:1.4"><i class="fa-solid fa-hand-holding-dollar"></i> ${fmt(flowOut)} keluar utk cicilan pokok/beri pinjaman <span style="color:var(--txm)">(bukan pengeluaran, tidak dihitung di sini)</span></div>`:''}
     </div>
     <div class="card">
       <div class="stat-icon" style="background:var(--gold-l);color:var(--gold)"><i class="fa-solid fa-piggy-bank"></i></div>
@@ -1802,10 +2001,17 @@ function rDash(el) {
         <div><div style="font-size:10.5px;color:var(--txm);font-weight:700;text-transform:uppercase">Hutang</div><div style="font-weight:700;color:var(--expense)">${fmt(hutang)}</div></div>
       </div>
     </div>
+    <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-size:11.5px;color:var(--tx2);line-height:1.7">
+      <b>Rincian Total Saldo ${fmt(bal)}:</b>
+      arus riil (pemasukan − pengeluaran) <b>${sg(realNet)}</b> ·
+      dana hutang/piutang <b style="color:var(--gold)">${sg(debtNet)}</b> ·
+      transfer antar akun <b>${sg(trNet)}</b>
+    </div>
   </div>
 
   <div id="ai-analysis-wrap" style="margin-bottom:20px"></div>
   <div id="fx-rates-wrap" style="margin-bottom:20px"></div>
+  <div id="fx-chart-wrap" style="margin-bottom:20px"></div>
   ${dashTargetsHtml()}
 
   <div class="grid-2-1" style="margin-bottom:20px">
@@ -1832,6 +2038,7 @@ function rDash(el) {
 
   renderAIAnalysis();
   fillFxRatesWidget(); // async, tidak memblokir render dashboard
+  fillFxChartWidget();
   countUp('stat-bal', bal, v => fmt(v));
   countUp('stat-inc', inc, v => fmt(v));
   countUp('stat-exp', exp, v => fmt(v));
@@ -1858,6 +2065,7 @@ function rDash(el) {
 }
 
 function renderDashCharts() {
+  drawFxChart();   // grafik kurs memakai data yg sudah ada (tanpa fetch) saat tema berubah / layar di-resize
   const bc = document.getElementById('ch-bar');
   if (bc) {
     const labels=[], incD=[], expD=[];
@@ -1933,8 +2141,10 @@ function rCal(el) {
     const inc  = sumType(realTxns,'income');
     const exp  = sumType(realTxns,'expense');
     const hasDebtFlow = txns.some(t => !isRealFlow(t));
+    const debtIn  = sumType(txns.filter(t => t.flow === 'hutang'), 'income');
+    const debtOut = sumType(txns.filter(t => t.flow === 'hutang'), 'expense');
     const dueDebts = debtsByDue[dateStr] || [];
-    cells.push({ day: d, type: 'current', dateStr, txns, inc, exp, hasDebtFlow, dueDebts });
+    cells.push({ day: d, type: 'current', dateStr, txns, inc, exp, hasDebtFlow, debtIn, debtOut, dueDebts });
   }
   const remaining = (7 - (cells.length % 7)) % 7;
   for (let i = 1; i <= remaining; i++) cells.push({ day: i, type: 'next' });
@@ -2008,6 +2218,8 @@ function rCal(el) {
         </div>
         ${hasInc ? `<div class="cal-income-pill"><i class="fa-solid fa-plus" style="font-size:7px"></i>${fmtS(c.inc)}</div>` : ''}
         ${hasExp ? `<div class="cal-expense-pill"><i class="fa-solid fa-minus" style="font-size:7px"></i>${fmtS(c.exp)}</div>` : ''}
+        ${c.debtIn>0 ? `<div class="cal-debt-pill" title="Dana pinjaman/piutang MASUK ke akun (bukan pendapatan)"><i class="fa-solid fa-hand-holding-dollar" style="font-size:7px"></i>+${fmtS(c.debtIn)}</div>` : ''}
+        ${c.debtOut>0 ? `<div class="cal-debt-pill" title="Dana KELUAR utk cicilan pokok/beri pinjaman (bukan pengeluaran)"><i class="fa-solid fa-hand-holding-dollar" style="font-size:7px"></i>−${fmtS(c.debtOut)}</div>` : ''}
         ${hasTxn && !hasInc && !hasExp ? `<div style="width:5px;height:5px;border-radius:50%;background:var(--acc);margin:4px auto 0;box-shadow:0 0 4px var(--acc)"></div>` : ''}
         ${c.hasDebtFlow ? `<div title="Ada arus kas Hutang/Piutang/Transfer di hari ini" style="width:5px;height:5px;border-radius:50%;background:#8A90A8;margin:3px auto 0"></div>` : ''}
         ${c.dueDebts && c.dueDebts.length ? `<div class="badge" title="Jatuh tempo: ${c.dueDebts.map(d=>esc(d.person)).join(', ')}" style="background:var(--expense-l);color:var(--expense);font-size:8px;padding:1px 5px;margin-top:2px"><i class="fa-solid fa-hourglass-end" style="font-size:7px"></i> ${c.dueDebts.length>1?c.dueDebts.length+'x tempo':'Tempo'}</div>` : ''}
@@ -2080,7 +2292,7 @@ window.calDayClick = function(dateStr) {
 
   const txnRow = t => {
     const c = catObj(t.categoryId), a = accObj(t.accountId);
-    const isDebtFlow = t.flow === 'hutang';
+    const isDebtFlow = t.flow === 'hutang' || t.flow === 'transfer';
     return `<div style="display:flex;align-items:center;gap:11px;padding:10px 0;border-bottom:1px solid var(--border)">
       <div style="width:38px;height:38px;border-radius:11px;background:${c.color}18;color:${c.color};display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0;box-shadow:var(--neu-pressed-sm)">
         <i class="fa-solid ${c.icon}"></i>
@@ -2090,7 +2302,7 @@ window.calDayClick = function(dateStr) {
         <div style="font-size:11px;color:var(--txm);margin-top:2px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
           <span class="badge" style="background:${c.color}18;color:${c.color};font-size:9.5px"><i class="fa-solid ${c.icon}" style="font-size:8px"></i> ${esc(c.name)}</span>
           <span style="font-size:10px"><i class="fa-solid ${a.icon}" style="color:${a.color}"></i> ${esc(a.name)}</span>
-          ${isDebtFlow?`<span class="badge" style="background:#8A90A818;color:#8A90A8;font-size:9px" title="Arus kas hutang/piutang — tidak dihitung sebagai pendapatan/pengeluaran"><i class="fa-solid fa-hand-holding-dollar" style="font-size:8px"></i> Hutang/Piutang</span>`:''}
+          ${isDebtFlow?`<span class="badge" style="background:#8A90A818;color:#8A90A8;font-size:9px" title="Arus kas hutang/piutang — tidak dihitung sebagai pendapatan/pengeluaran"><i class="fa-solid fa-hand-holding-dollar" style="font-size:8px"></i> ${esc(debtFlowLabel(t))}</span>`:''}
         </div>
         ${t.note?`<div style="font-size:10.5px;color:var(--txm);margin-top:2px;font-style:italic">"${esc(t.note)}"</div>`:''}
       </div>
@@ -2241,7 +2453,7 @@ function fillTxnTable() {
     const c=catObj(t.categoryId), a=accObj(t.accountId);
     return `<tr>
       <td style="white-space:nowrap;font-size:12px;color:var(--tx2)">${fmtDate(t.date,{day:'numeric',month:'short',year:'numeric'})}</td>
-      <td><div style="font-weight:600;font-size:13px">${esc(t.description)}${t.transferId?' <i class="fa-solid fa-right-left" style="font-size:9px;color:var(--txm)" title="Transfer"></i>':''}${t.flow === 'hutang'?' <span class="badge" style="background:#8A90A818;color:#8A90A8;font-size:9px" title="Tidak dihitung sebagai pendapatan/pengeluaran"><i class="fa-solid fa-hand-holding-dollar" style="font-size:8px"></i> H/P</span>':''}</div>${t.note?`<div style="font-size:10.5px;color:var(--txm);margin-top:1px">${esc(t.note)}</div>`:''}</td>
+      <td><div style="font-weight:600;font-size:13px">${esc(t.description)}${t.transferId?' <i class="fa-solid fa-right-left" style="font-size:9px;color:var(--txm)" title="Transfer"></i>':''}${t.flow === 'hutang'?' <span class="badge" style="background:#8A90A818;color:#8A90A8;font-size:9px" title="Uang ini TETAP masuk/keluar di saldo akun, tapi tidak dihitung sebagai pendapatan/pengeluaran"><i class="fa-solid fa-hand-holding-dollar" style="font-size:8px"></i> '+esc(debtFlowLabel(t))+'</span>':''}</div>${t.note?`<div style="font-size:10.5px;color:var(--txm);margin-top:1px">${esc(t.note)}</div>`:''}</td>
       <td><span class="badge" style="background:${c.color}18;color:${c.color}"><i class="fa-solid ${c.icon}" style="font-size:9px"></i> ${esc(c.name)}</span></td>
       <td style="font-size:12.5px;color:var(--tx2)"><i class="fa-solid ${a.icon}" style="color:${a.color};margin-right:4px"></i>${esc(a.name)}</td>
       <td style="text-align:right;font-weight:700;font-size:13px;color:${t.type==='income'?'var(--income)':'var(--expense)'};white-space:nowrap">${t.type==='income'?'+':'−'}${fmt(t.amount)}</td>
@@ -2822,6 +3034,7 @@ function debtCardHtml(d, { isHistory }) {
   const isOverdue = !isLunas && d.dueDate && d.dueDate < today();
   const pct = d.amount>0 ? Math.min(((d.paid||0)/d.amount)*100,100) : 0;
   const isHutang = d.type === 'hutang';
+  const hasDisb = S.transactions.some(t => t.debtId === d.id && txnDebtRole(t) === 'disburse');
   const color = isHutang ? 'var(--expense)' : 'var(--income)';
   const statusBadge = isLunas
     ? `<span class="badge" style="background:var(--income-l);color:var(--income)"><i class="fa-solid fa-check"></i> Lunas</span>`
@@ -2855,6 +3068,7 @@ function debtCardHtml(d, { isHistory }) {
       ${statusBadge}
       ${!isLunas?`<button class="btn btn-sm btn-primary" onclick="openPayDebtModal('${d.id}')">${isHutang?'Bayar':'Terima'}</button>`:''}
     </div>
+    ${!hasDisb ? `<div style="margin-top:9px;font-size:11px;color:var(--gold);line-height:1.5"><i class="fa-solid fa-triangle-exclamation"></i> Dana ${isHutang?'pinjaman ini':'yang Anda pinjamkan'} belum tercatat di akun mana pun (saldo tidak berubah). <a href="#" style="color:var(--acc);font-weight:700" onclick="recordDebtDisbursement('${d.id}');return false">Catat ke akun</a></div>` : ''}
   </div>`;
 }
 
@@ -2913,14 +3127,15 @@ window.openDebtModal = function(editId) {
     ${!d ? `
     <div style="padding:12px;border-radius:10px;background:var(--bg2);border:1px solid var(--border);margin-top:6px">
       <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:var(--tx2);cursor:pointer;margin-bottom:0">
-        <input type="checkbox" id="df-astxn" checked style="width:16px;height:16px" onchange="document.getElementById('df-astxn-fields').style.display=this.checked?'':'none'">
+        <input type="checkbox" id="df-astxn" checked style="width:16px;height:16px" onchange="document.getElementById('df-astxn-fields').style.display=this.checked?'':'none';document.getElementById('df-astxn-warn').style.display=this.checked?'none':''">
         <span id="df-astxn-label">Catat juga penerimaan dana ke akun (uang benar-benar masuk ke dompet saya)</span>
       </label>
       <div id="df-astxn-fields" style="margin-top:10px">
-        <div class="form-group" style="margin-bottom:0"><label class="form-label">Akun</label><select class="form-input" id="df-acc">${S.accounts.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select></div>
+        <div class="form-group" style="margin-bottom:0"><label class="form-label" id="df-acc-label">Akun Penerima Dana</label><select class="form-input" id="df-acc">${S.accounts.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select></div>
         <p style="font-size:10.5px;color:var(--txm);margin-top:6px;margin-bottom:0">Pakai tanggal "Tanggal Pinjam" di atas — otomatis tersambung ke Kalender & Transaksi di tanggal itu juga.</p>
       </div>
       <p style="font-size:10.5px;color:var(--txm);margin-top:8px;margin-bottom:0">Dana ini <b>tidak</b> dihitung sebagai pendapatan/pengeluaran di Dashboard & Laporan — cuma pergerakan kas nyata.</p>
+      <p id="df-astxn-warn" style="display:none;font-size:11px;color:var(--expense);margin-top:8px;margin-bottom:0;font-weight:600"><i class="fa-solid fa-triangle-exclamation"></i> Kalau tidak dicentang, hutang hanya dicatat sebagai kewajiban — uangnya TIDAK masuk ke saldo akun mana pun, dan kekayaan bersih turun sebesar hutang ini. Bisa dicatat ke akun belakangan lewat tombol "Catat ke akun" di kartu hutang.</p>
     </div>` : ''}
   </div>
   <div class="modal-footer"><button class="btn" onclick="closeModal()">Batal</button><button class="btn btn-primary" id="df-save-btn" onclick="saveDebt('${editId||''}')">${d?'Simpan':'Catat'}</button></div>`);
@@ -2929,6 +3144,8 @@ window.openDebtModal = function(editId) {
   const updateAstxnLabel = () => {
     const lbl = document.getElementById('df-astxn-label');
     const bl  = document.getElementById('df-borrow-label');
+    const al = document.getElementById('df-acc-label');
+    if (al) al.textContent = _dType === 'hutang' ? 'Akun Penerima Dana (uang pinjaman masuk ke sini)' : 'Akun Sumber Dana (uang keluar dari sini)';
     if (lbl) lbl.textContent = _dType === 'hutang'
       ? 'Catat juga penerimaan dana ke akun (uang benar-benar masuk ke dompet saya)'
       : 'Catat juga pengeluaran dana dari akun (uang benar-benar keluar dari dompet saya)';
@@ -3005,7 +3222,7 @@ window.saveDebt = async function(editId) {
       await saveSettings();
     }
 
-    toast(editId?'Data diperbarui' + (plan.setTxns ? ' & transaksi terkait disesuaikan' : ''):'Dicatat'); closeModal(); renderPage();
+    toast(editId ? 'Data diperbarui' + (plan.setTxns ? ' & transaksi terkait disesuaikan' : '') : (plan.addTxns ? 'Dicatat — dana tercatat di akun & muncul di Transaksi/Kalender' : 'Dicatat TANPA dana masuk ke akun — saldo tidak berubah'), editId || plan.addTxns ? 'success' : 'info'); closeModal(); renderPage();
   } catch(e) { toast('Gagal: '+e.message,'error'); if(btn){btn.disabled=false;btn.textContent=editId?'Simpan':'Catat';} }
 };
 
@@ -3061,6 +3278,39 @@ window.openDebtHistoryModal = function(id) {
     <button class="btn" onclick="closeModal();goToTransaksiByDebt('${d.id}')">Lihat di Transaksi</button>
     <button class="btn btn-primary" onclick="closeModal()">Tutup</button>
   </div>`);
+};
+// Mencatat pencairan awal belakangan (mis. hutang dulu dicatat tanpa centang "catat dana ke akun")
+window.recordDebtDisbursement = function(id) {
+  const d = S.debts.find(x => x.id === id); if (!d) return;
+  const isH = d.type === 'hutang';
+  openModal(`
+  <div class="modal-header"><h3>Catat Dana ke Akun</h3><button class="btn-icon" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button></div>
+  <div class="modal-body">
+    <p style="font-size:12.5px;color:var(--tx2);margin-bottom:14px">${isH
+      ? `Uang pinjaman dari <b>${esc(d.person)}</b> sebesar <b>${fmt(d.amount)}</b> akan dicatat <b>MASUK</b> ke akun:`
+      : `Uang yang dipinjamkan ke <b>${esc(d.person)}</b> sebesar <b>${fmt(d.amount)}</b> akan dicatat <b>KELUAR</b> dari akun:`}</p>
+    <div class="form-group"><label class="form-label">Akun</label><select class="form-input" id="rd-acc">${S.accounts.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select></div>
+    <div class="form-group"><label class="form-label">Tanggal</label><input type="date" class="form-input" id="rd-date" value="${d.borrowDate || today()}"></div>
+    <p style="font-size:10.5px;color:var(--txm)">Dicatat sebagai arus kas hutang/piutang: mengubah saldo akun, tidak dihitung sebagai pendapatan/pengeluaran.</p>
+  </div>
+  <div class="modal-footer"><button class="btn" onclick="closeModal()">Batal</button><button class="btn btn-primary" id="rd-save-btn" onclick="saveDebtDisbursement('${id}')">Catat</button></div>`);
+};
+window.saveDebtDisbursement = async function(id) {
+  const d = S.debts.find(x => x.id === id); if (!d) return;
+  const accId = document.getElementById('rd-acc').value, date = document.getElementById('rd-date').value;
+  if (!accId || !date) { toast('Pilih akun dan tanggal','error'); return; }
+  if (S.transactions.some(t => t.debtId === id && txnDebtRole(t) === 'disburse')) { toast('Dana sudah tercatat untuk catatan ini','info'); closeModal(); return; }
+  const btn = document.getElementById('rd-save-btn'); if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>'; }
+  try {
+    const isH = d.type === 'hutang';
+    const cat = await ensureDebtCategory(isH ? 'income' : 'expense');
+    await commitPlan({ addTxns: [{ id: newId('transactions'), data: {
+      date, amount: d.amount, categoryId: cat.id, accountId: accId,
+      description: (isH ? 'Menerima pinjaman dari ' : 'Memberi pinjaman ke ') + d.person, note: '',
+      type: isH ? 'income' : 'expense', flow: 'hutang', debtId: id, debtRole: 'disburse'
+    } }] });
+    toast('Dana tercatat di akun — saldo diperbarui'); closeModal(); renderPage();
+  } catch(e) { toast('Gagal: ' + e.message, 'error'); if (btn) { btn.disabled = false; btn.textContent = 'Catat'; } }
 };
 window.goToTransaksiByDebt = function(debtId) {
   txnFilter = { type:'all', search:'', month:'', categoryId:'', debtId, from:'', to:'' };
@@ -3144,6 +3394,7 @@ function rAcc(el) {
   <div class="grid-auto">${S.accounts.map(a => {
     const b = accBal(a.id);
     const tl = a.type==='cash'?'Tunai':a.type==='bank'?'Bank':'E-Wallet';
+    const dflow = S.transactions.filter(t => t.accountId===a.id && t.flow==='hutang').reduce((s,t) => s + (t.type==='income' ? t.amount : -t.amount), 0);
     const purpose = a.purpose || 'transaksi';
     const purposeLabel = { transaksi:'Transaksi Harian', tabungan:'Tabungan', lainnya:'Lainnya' }[purpose];
     const purposeColor = purpose==='tabungan' ? 'var(--income)' : purpose==='transaksi' ? 'var(--acc)' : 'var(--txm)';
@@ -3164,6 +3415,7 @@ function rAcc(el) {
         </div>
       </div>
       <div style="margin-top:14px;font-family:'Outfit';font-size:24px;font-weight:800;color:${b>=0?'var(--income)':'var(--expense)'};position:relative;z-index:1">${fmt(b)}</div>
+      ${dflow!==0?`<div style="font-size:10.5px;color:var(--gold);margin-top:4px;position:relative;z-index:1"><i class="fa-solid fa-hand-holding-dollar"></i> termasuk ${dflow>0?'+':''}${fmt(dflow)} dari hutang/piutang</div>`:''}
       <div style="margin-top:8px;position:relative;z-index:1"><span class="badge" style="background:${purposeColor}18;color:${purposeColor}"><i class="fa-solid ${purpose==='tabungan'?'fa-piggy-bank':purpose==='transaksi'?'fa-cart-shopping':'fa-tag'}" style="font-size:9px"></i> ${purposeLabel}</span></div>
     </div>`;
   }).join('')}</div>`;

@@ -43,10 +43,20 @@ sh tests/run-all.sh
 Memeriksa sintaks, kesesuaian tombol/handler, dan alur sinkronisasi uang (hutang, cicilan, transfer, impor, reset)
 memakai Firestore tiruan — tidak menyentuh data asli.
 
+## Grafik kurs (Dashboard)
+Memakai **Frankfurter API v2** (`https://api.frankfurter.dev/v2/rates`) — tanpa API key, bisa dipanggil langsung dari GitHub Pages.
+Garis hijau tanpa titik, tombol **D** (3 hari data terakhir), **W** (7 hari), **M** (30 hari). Hasil di-cache di `localStorage`
+per (mata uang × time frame) untuk **hari yang sama**; klik ulang tidak memicu request. Cache hari sebelumnya dibuang otomatis;
+bila API gagal, data tersimpan terakhir tetap ditampilkan. Data kurs harian bisa tertinggal 1–2 hari dari tanggal hari ini.
+
 ## Cara kerja sinkronisasi uang (ringkas)
 * Saldo akun = jumlah semua transaksi di akun tsb (termasuk arus hutang/piutang & transfer).
 * Pendapatan/pengeluaran di Dashboard, Laporan, Anggaran, Target, dan AI **hanya** menghitung arus kas riil —
   pinjaman, cicilan pokok, dan transfer antar-akun dikecualikan (bunga/denda tetap dihitung).
 * Cicilan lewat tombol *Bayar/Terima* **atau** lewat form Transaksi (centang "Ini pembayaran Hutang Saya?")
   sama-sama mengurangi sisa hutang. Edit/hapus transaksi cicilan otomatis menyesuaikan sisa hutang.
+* **Dana hutang/piutang** masuk ke akun yang dipilih saat "Catat Baru" (centang *catat dana ke akun*), tampil sebagai
+  lencana "Dana Pinjaman Masuk" di Transaksi, pil kuning di Kalender, dan baris "termasuk … dari hutang/piutang" di Akun.
+  Dashboard menampilkan *Rincian Total Saldo* = arus riil + hutang/piutang + transfer. Hutang lama yang dicatat tanpa centang
+  bisa diperbaiki lewat tombol **Catat ke akun** di kartu hutang.
 * Setiap perubahan yang menyentuh beberapa data sekaligus ditulis **atomik** (semua berhasil atau semua batal).
