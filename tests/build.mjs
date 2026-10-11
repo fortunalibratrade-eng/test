@@ -8,6 +8,6 @@ export const __x = { S: ()=>S, setTxnType:v=>{_txnType=v}, monthTxns, txnDebtRol
   targetEvalForKey: typeof targetEvalForKey!=='undefined'?targetEvalForKey:null, recapFor: typeof recapFor!=='undefined'?recapFor:null,
   parseScheduleStrict: typeof parseScheduleStrict!=='undefined'?parseScheduleStrict:null, computeAIAnalysis, computeFullAIReport, fmt, fmtS,
   totalBal, accBal, netWorth, totalHutang, totalPiutang, filterReal, sumType, periodState: typeof periodState!=='undefined'?periodState:null,
-  weeksInMonth, loadFxChart, fetchFxRates, fillFxChartWidget, fxState:()=>_fxChartState, fxMem:_fxChartMem, FX_CHART_TF, today, debtRemaining, txnFilter:()=>txnFilter, budgetNativeSpent, fillTxnTable, localDateStr, weekStartOf };
+  weeksInMonth, loadFxChart, fetchFxRates, fillFxChartWidget, fxState:()=>_fxChartState, fxMem:_fxChartMem, cashSummary: typeof cashSummary!=='undefined'?cashSummary:null, calYearMonths: typeof calYearMonths!=='undefined'?calYearMonths:null, FX_CHART_TF, today, debtRemaining, txnFilter:()=>txnFilter, budgetNativeSpent, fillTxnTable, localDateStr, weekStartOf };
 `;
 fs.writeFileSync(out, s);

@@ -59,4 +59,7 @@ bila API gagal, data tersimpan terakhir tetap ditampilkan. Data kurs harian bisa
   lencana "Dana Pinjaman Masuk" di Transaksi, pil kuning di Kalender, dan baris "termasuk … dari hutang/piutang" di Akun.
   Dashboard menampilkan *Rincian Total Saldo* = arus riil + hutang/piutang + transfer. Hutang lama yang dicatat tanpa centang
   bisa diperbaiki lewat tombol **Catat ke akun** di kartu hutang.
+* **Kalender** menampilkan **total** uang masuk/keluar akun (riil + hutang/piutang) dengan rincian "Riil · Hutang/Piutang" di
+  bawah tiap angka (bulan, hari, dan **tampilan Tahun**: grafik 12 bulan bertumpuk, kartu per bulan, tabel rincian).
+  Transfer antar akun netral sehingga tidak dihitung. Dashboard/Laporan/AI sengaja memakai arus **riil** saja untuk analisis.
 * Setiap perubahan yang menyentuh beberapa data sekaligus ditulis **atomik** (semua berhasil atau semua batal).

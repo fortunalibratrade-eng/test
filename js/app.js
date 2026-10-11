@@ -1307,6 +1307,7 @@ function renderCharts() {
     if (typeof Chart === 'undefined') return;   // CDN Chart.js gagal dimuat: halaman tetap jalan tanpa grafik
     if (S.page === 'dashboard') renderDashCharts();
     if (S.page === 'reports')   renderReportCharts();
+    if (S.page === 'calendar')  drawCalYearChart();
   });
 }
 
@@ -2105,8 +2106,66 @@ function renderDashCharts() {
 /* ── CALENDAR ── */
 let _calYear  = new Date().getFullYear();
 let _calMonth = new Date().getMonth();
+let _calView  = 'month';   // 'month' | 'year'
 
-function rCal(el) {
+/* ═══════════════════════════════════════════
+   KALENDER — angka TOTAL + rincian
+   Pemasukan/Pengeluaran = SEMUA uang yang masuk/keluar akun = arus riil + arus hutang/piutang.
+   Rinciannya (riil vs hutang/piutang) selalu tampil di bawah angka. Transfer antar akun bersifat netral
+   (satu sisi keluar, satu sisi masuk) sehingga tidak dihitung, tapi dicatat di keterangan.
+   (Dashboard/Laporan/AI tetap memakai arus RIIL saja untuk analisis — itu memang disengaja.)
+═══════════════════════════════════════════ */
+function cashSummary(arr) {
+  const real = filterReal(arr), debt = arr.filter(t => t.flow === 'hutang'), tr = arr.filter(t => t.flow === 'transfer');
+  const inReal = sumType(real,'income'), outReal = sumType(real,'expense');
+  const inDebt = sumType(debt,'income'), outDebt = sumType(debt,'expense');
+  return { inReal, outReal, inDebt, outDebt,
+    inTotal: inReal + inDebt, outTotal: outReal + outDebt,
+    net: inReal + inDebt - outReal - outDebt, netReal: inReal - outReal, netDebt: inDebt - outDebt,
+    transfer: sumType(tr,'expense'), count: arr.length };
+}
+function calSumSub(real, debt) {
+  return debt !== 0
+    ? `<div class="cal-sum-sub">Riil <b>${fmt(real)}</b> · Hutang/Piutang <b class="g">${fmt(debt)}</b></div>`
+    : `<div class="cal-sum-sub">Semuanya arus riil</div>`;
+}
+function calSumCard(icon, bg, color, label, value, subHtml) {
+  return `<div class="cal-sum-card">
+    <div class="cal-sum-icon" style="background:${bg};color:${color}"><i class="fa-solid ${icon}"></i></div>
+    <div style="min-width:0"><div class="cal-sum-label">${label}</div><div class="cal-sum-value" style="color:${color}">${value}</div>${subHtml}</div>
+  </div>`;
+}
+function calSummaryCards(cs) {
+  const nc = cs.net >= 0 ? 'var(--income)' : 'var(--expense)', nb = cs.net >= 0 ? 'var(--income-l)' : 'var(--expense-l)';
+  return `<div class="cal-summary">
+    ${calSumCard('fa-arrow-down','var(--income-l)','var(--income)','Pemasukan', fmt(cs.inTotal), calSumSub(cs.inReal, cs.inDebt))}
+    ${calSumCard('fa-arrow-up','var(--expense-l)','var(--expense)','Pengeluaran', fmt(cs.outTotal), calSumSub(cs.outReal, cs.outDebt))}
+    ${calSumCard('fa-scale-balanced', nb, nc, 'Saldo Net', (cs.net >= 0 ? '+' : '') + fmt(cs.net), calSumSub(cs.netReal, cs.netDebt))}
+  </div>
+  <div class="cal-legend"><i class="fa-solid fa-circle-info"></i> Pemasukan &amp; Pengeluaran = <b>total semua uang yang masuk/keluar akun</b> (riil + hutang/piutang); rinciannya di bawah tiap angka.${cs.transfer > 0 ? ` Transfer antar akun ${fmt(cs.transfer)} tidak dihitung (netral).` : ''}</div>`;
+}
+function calToolbarHtml() {
+  const n = new Date();
+  const atNow = _calYear === n.getFullYear() && (_calView === 'year' || _calMonth === n.getMonth());
+  return `<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+    <div class="type-toggle" style="min-width:200px">
+      <button class="${_calView==='month'?'sel-active':''}" onclick="setCalView('month')"><i class="fa-solid fa-calendar-days" style="margin-right:5px;font-size:10px"></i>Bulan</button>
+      <button class="${_calView==='year'?'sel-active':''}" onclick="setCalView('year')"><i class="fa-solid fa-calendar" style="margin-right:5px;font-size:10px"></i>Tahun</button>
+    </div>
+    ${atNow ? '' : `<button class="btn btn-sm" onclick="calToNow()"><i class="fa-solid fa-rotate-left"></i> ${_calView==='year'?'Tahun ini':'Bulan ini'}</button>`}
+  </div>`;
+}
+function calNavHtml(titleHtml, prevTitle, nextTitle) {
+  return `<div class="cal-nav">
+    <button class="btn-icon" onclick="calPrev()" title="${prevTitle}"><i class="fa-solid fa-chevron-left"></i></button>
+    <div class="cal-month-title">${titleHtml}</div>
+    <button class="btn-icon" onclick="calNext()" title="${nextTitle}"><i class="fa-solid fa-chevron-right"></i></button>
+  </div>`;
+}
+
+function rCal(el) { return _calView === 'year' ? rCalYear(el) : rCalMonth(el); }
+
+function rCalMonth(el) {
   const todayStr = today();
   const y = _calYear, m = _calMonth;
   const firstDay    = new Date(y, m, 1).getDay();
@@ -2122,78 +2181,26 @@ function rCal(el) {
   const debtsByDue = {};
   S.debts.forEach(d => { if (d.dueDate && debtRemaining(d) > 0) { (debtsByDue[d.dueDate] = debtsByDue[d.dueDate]||[]).push(d); } });
 
-  const monthTx  = filterReal(S.transactions.filter(t => t.date.startsWith(`${y}-${String(m+1).padStart(2,'0')}`)));
-  const monthInc = sumType(monthTx,'income');
-  const monthExp = sumType(monthTx,'expense');
-  const monthNet = monthInc - monthExp;
-  const txnCount = (S.transactions.filter(t => t.date.startsWith(`${y}-${String(m+1).padStart(2,'0')}`))).length;
-
+  const monthAll = txnsInMonth(y, m + 1);
+  const cs = cashSummary(monthAll);
   const DOW = ['Min','Sen','Sel','Rab','Kam','Jum','Sab'];
 
   let cells = [];
-  for (let i = 0; i < firstDay; i++) {
-    cells.push({ day: daysInPrev - firstDay + 1 + i, type: 'prev' });
-  }
+  for (let i = 0; i < firstDay; i++) cells.push({ day: daysInPrev - firstDay + 1 + i, type: 'prev' });
   for (let d = 1; d <= daysInMonth; d++) {
     const dateStr = `${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
     const txns = txnsByDate[dateStr] || [];
-    const realTxns = filterReal(txns);
-    const inc  = sumType(realTxns,'income');
-    const exp  = sumType(realTxns,'expense');
-    const hasDebtFlow = txns.some(t => !isRealFlow(t));
-    const debtIn  = sumType(txns.filter(t => t.flow === 'hutang'), 'income');
-    const debtOut = sumType(txns.filter(t => t.flow === 'hutang'), 'expense');
-    const dueDebts = debtsByDue[dateStr] || [];
-    cells.push({ day: d, type: 'current', dateStr, txns, inc, exp, hasDebtFlow, debtIn, debtOut, dueDebts });
+    const day = cashSummary(txns);
+    cells.push({ day: d, type: 'current', dateStr, txns, inT: day.inTotal, outT: day.outTotal, debtIn: day.inDebt, debtOut: day.outDebt,
+      hasTransfer: txns.some(t => t.flow === 'transfer'), dueDebts: debtsByDue[dateStr] || [] });
   }
   const remaining = (7 - (cells.length % 7)) % 7;
   for (let i = 1; i <= remaining; i++) cells.push({ day: i, type: 'next' });
 
   el.innerHTML = `
-  <div class="cal-summary">
-    <div class="cal-sum-card">
-      <div class="cal-sum-icon" style="background:var(--income-l);color:var(--income)">
-        <i class="fa-solid fa-arrow-down"></i>
-      </div>
-      <div>
-        <div class="cal-sum-label">Pemasukan</div>
-        <div class="cal-sum-value" style="color:var(--income)">${fmt(monthInc)}</div>
-      </div>
-    </div>
-    <div class="cal-sum-card">
-      <div class="cal-sum-icon" style="background:var(--expense-l);color:var(--expense)">
-        <i class="fa-solid fa-arrow-up"></i>
-      </div>
-      <div>
-        <div class="cal-sum-label">Pengeluaran</div>
-        <div class="cal-sum-value" style="color:var(--expense)">${fmt(monthExp)}</div>
-      </div>
-    </div>
-    <div class="cal-sum-card">
-      <div class="cal-sum-icon" style="background:${monthNet>=0?'var(--income-l)':'var(--expense-l)'};color:${monthNet>=0?'var(--income)':'var(--expense)'}">
-        <i class="fa-solid fa-scale-balanced"></i>
-      </div>
-      <div>
-        <div class="cal-sum-label">Saldo Net</div>
-        <div class="cal-sum-value" style="color:${monthNet>=0?'var(--income)':'var(--expense)'}">
-          ${monthNet>=0?'+':''}${fmt(monthNet)}
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="cal-nav">
-    <button class="btn-icon" onclick="calPrev()" title="Bulan sebelumnya">
-      <i class="fa-solid fa-chevron-left"></i>
-    </button>
-    <div class="cal-month-title">
-      ${MO_FULL[m]} ${y}
-      <small>${txnCount} transaksi</small>
-    </div>
-    <button class="btn-icon" onclick="calNext()" title="Bulan berikutnya">
-      <i class="fa-solid fa-chevron-right"></i>
-    </button>
-  </div>
+  ${calToolbarHtml()}
+  ${calSummaryCards(cs)}
+  ${calNavHtml(`${MO_FULL[m]} ${y}<small>${cs.count} transaksi</small>`, 'Bulan sebelumnya', 'Bulan berikutnya')}
 
   <div class="cal-grid" style="margin-bottom:6px">
     ${DOW.map(d=>`<div class="cal-day-header">${d}</div>`).join('')}
@@ -2201,41 +2208,94 @@ function rCal(el) {
 
   <div class="cal-grid" id="cal-cells">
     ${cells.map(c => {
-      if (c.type !== 'current') {
-        return `<div class="cal-cell other-month"><div class="cal-date"><span>${c.day}</span></div></div>`;
-      }
+      if (c.type !== 'current') return `<div class="cal-cell other-month"><div class="cal-date"><span>${c.day}</span></div></div>`;
       const isToday = c.dateStr === todayStr;
       const hasTxn  = c.txns.length > 0;
-      const hasInc  = c.inc > 0;
-      const hasExp  = c.exp > 0;
       return `<div class="cal-cell${isToday?' today':''}${hasTxn?' has-txn':''}" onclick="calDayClick('${c.dateStr}')">
         ${hasTxn ? `<div class="cal-txn-count">${c.txns.length}</div>` : ''}
-        <div class="cal-date">
-          ${isToday
-            ? `<div class="cal-today-badge">${c.day}</div>`
-            : `<span>${c.day}</span>`
-          }
-        </div>
-        ${hasInc ? `<div class="cal-income-pill"><i class="fa-solid fa-plus" style="font-size:7px"></i>${fmtS(c.inc)}</div>` : ''}
-        ${hasExp ? `<div class="cal-expense-pill"><i class="fa-solid fa-minus" style="font-size:7px"></i>${fmtS(c.exp)}</div>` : ''}
-        ${c.debtIn>0 ? `<div class="cal-debt-pill" title="Dana pinjaman/piutang MASUK ke akun (bukan pendapatan)"><i class="fa-solid fa-hand-holding-dollar" style="font-size:7px"></i>+${fmtS(c.debtIn)}</div>` : ''}
-        ${c.debtOut>0 ? `<div class="cal-debt-pill" title="Dana KELUAR utk cicilan pokok/beri pinjaman (bukan pengeluaran)"><i class="fa-solid fa-hand-holding-dollar" style="font-size:7px"></i>−${fmtS(c.debtOut)}</div>` : ''}
-        ${hasTxn && !hasInc && !hasExp ? `<div style="width:5px;height:5px;border-radius:50%;background:var(--acc);margin:4px auto 0;box-shadow:0 0 4px var(--acc)"></div>` : ''}
-        ${c.hasDebtFlow ? `<div title="Ada arus kas Hutang/Piutang/Transfer di hari ini" style="width:5px;height:5px;border-radius:50%;background:#8A90A8;margin:3px auto 0"></div>` : ''}
+        <div class="cal-date">${isToday ? `<div class="cal-today-badge">${c.day}</div>` : `<span>${c.day}</span>`}</div>
+        ${c.inT > 0 ? `<div class="cal-income-pill" title="Total pemasukan hari ini (riil + hutang/piutang)"><i class="fa-solid fa-plus" style="font-size:7px"></i>${fmtS(c.inT)}</div>` : ''}
+        ${c.debtIn > 0 ? `<div class="cal-debt-pill" title="Dari total pemasukan: ${fmt(c.debtIn)} berasal dari pinjaman/piutang (bukan pendapatan)">↳ hutang ${fmtS(c.debtIn)}</div>` : ''}
+        ${c.outT > 0 ? `<div class="cal-expense-pill" title="Total pengeluaran hari ini (riil + hutang/piutang)"><i class="fa-solid fa-minus" style="font-size:7px"></i>${fmtS(c.outT)}</div>` : ''}
+        ${c.debtOut > 0 ? `<div class="cal-debt-pill" title="Dari total pengeluaran: ${fmt(c.debtOut)} untuk cicilan pokok/beri pinjaman (bukan pengeluaran riil)">↳ hutang ${fmtS(c.debtOut)}</div>` : ''}
+        ${hasTxn && !c.inT && !c.outT && !c.hasTransfer ? `<div style="width:5px;height:5px;border-radius:50%;background:var(--acc);margin:4px auto 0;box-shadow:0 0 4px var(--acc)"></div>` : ''}
+        ${c.hasTransfer ? `<div title="Ada transfer antar akun (netral, tidak dihitung)" style="width:5px;height:5px;border-radius:50%;background:#8A90A8;margin:3px auto 0"></div>` : ''}
         ${c.dueDebts && c.dueDebts.length ? `<div class="badge" title="Jatuh tempo: ${c.dueDebts.map(d=>esc(d.person)).join(', ')}" style="background:var(--expense-l);color:var(--expense);font-size:8px;padding:1px 5px;margin-top:2px"><i class="fa-solid fa-hourglass-end" style="font-size:7px"></i> ${c.dueDebts.length>1?c.dueDebts.length+'x tempo':'Tempo'}</div>` : ''}
       </div>`;
     }).join('')}
   </div>`;
 }
 
+/* ── TAMPILAN TAHUN: ringkasan setahun, grafik 12 bulan (bertumpuk riil + hutang), kartu & tabel per bulan ── */
+function calYearMonths(y) { return Array.from({ length: 12 }, (_, i) => cashSummary(txnsInMonth(y, i + 1))); }
+function rCalYear(el) {
+  const y = _calYear, months = calYearMonths(y);
+  const yr = cashSummary(S.transactions.filter(t => t.date.startsWith(String(y))));
+  const n = new Date(), curM = n.getFullYear() === y ? n.getMonth() : -1;
+  const sg = v => (v >= 0 ? '+' : '') + fmt(v);
+  const monthCard = (cs, i) => `<div class="cal-month-card${i===curM?' now':''}${cs.count?'':' empty'}" onclick="calGoMonth(${i})" title="Buka kalender ${MO_FULL[i]} ${y}">
+      <div class="cmc-h"><b>${MO_FULL[i]}</b><span>${cs.count} transaksi</span></div>
+      <div class="cmc-row"><span>Masuk</span><b style="color:var(--income)">${fmt(cs.inTotal)}</b></div>
+      ${cs.inDebt > 0 ? `<div class="cmc-sub">↳ riil ${fmt(cs.inReal)} · hutang ${fmt(cs.inDebt)}</div>` : ''}
+      <div class="cmc-row"><span>Keluar</span><b style="color:var(--expense)">${fmt(cs.outTotal)}</b></div>
+      ${cs.outDebt > 0 ? `<div class="cmc-sub">↳ riil ${fmt(cs.outReal)} · hutang ${fmt(cs.outDebt)}</div>` : ''}
+      <div class="cmc-row cmc-net"><span>Net</span><b style="color:${cs.net>=0?'var(--income)':'var(--expense)'}">${sg(cs.net)}</b></div>
+    </div>`;
+  const tr = (label, cs, bold, click) => `<tr${click?` style="cursor:pointer" onclick="${click}"`:''}>
+      <td style="${bold?'font-weight:800':'font-weight:600'}">${label}</td>
+      <td style="text-align:right;color:var(--income);font-weight:700">${fmt(cs.inTotal)}</td>
+      <td style="text-align:right;color:var(--txm)">${fmt(cs.inReal)}</td><td style="text-align:right;color:var(--gold)">${fmt(cs.inDebt)}</td>
+      <td style="text-align:right;color:var(--expense);font-weight:700">${fmt(cs.outTotal)}</td>
+      <td style="text-align:right;color:var(--txm)">${fmt(cs.outReal)}</td><td style="text-align:right;color:var(--gold)">${fmt(cs.outDebt)}</td>
+      <td style="text-align:right;font-weight:800;color:${cs.net>=0?'var(--income)':'var(--expense)'}">${sg(cs.net)}</td></tr>`;
+  el.innerHTML = `
+  ${calToolbarHtml()}
+  ${calSummaryCards(yr)}
+  ${calNavHtml(`Tahun ${y}<small>${yr.count} transaksi</small>`, 'Tahun sebelumnya', 'Tahun berikutnya')}
+  <div class="card" style="margin-bottom:16px">
+    <h4 style="font-size:14px;margin-bottom:4px">Pemasukan &amp; Pengeluaran per Bulan</h4>
+    <p style="font-size:11px;color:var(--txm);margin-bottom:10px">Batang kiri = pemasukan, kanan = pengeluaran. Warna kuning = bagian dari hutang/piutang.</p>
+    <div class="chart-wrap" style="height:260px"><canvas id="ch-cal-year"></canvas></div>
+  </div>
+  <div class="cal-year-grid">${months.map(monthCard).join('')}</div>
+  <div class="card" style="margin-top:16px;overflow-x:auto">
+    <h4 style="font-size:14px;margin-bottom:12px">Rincian per Bulan — ${y}</h4>
+    <table class="data-table"><thead><tr><th>Bulan</th><th style="text-align:right">Pemasukan</th><th style="text-align:right">↳ Riil</th><th style="text-align:right">↳ Hutang/Piutang</th><th style="text-align:right">Pengeluaran</th><th style="text-align:right">↳ Riil</th><th style="text-align:right">↳ Hutang/Piutang</th><th style="text-align:right">Net</th></tr></thead>
+    <tbody>${months.map((cs,i) => tr(MO_FULL[i], cs, false, `calGoMonth(${i})`)).join('')}${tr(`TOTAL ${y}`, yr, true, '')}</tbody></table>
+    ${yr.transfer > 0 ? `<p style="font-size:10.5px;color:var(--txm);margin-top:10px">Transfer antar akun sebesar ${fmt(yr.transfer)} tahun ini tidak dihitung (netral).</p>` : ''}
+  </div>`;
+}
+function drawCalYearChart() {
+  if (_charts.calYear) { try { _charts.calYear.destroy(); } catch(e) {} delete _charts.calYear; }
+  const cv = document.getElementById('ch-cal-year');
+  if (!cv || _calView !== 'year' || typeof Chart === 'undefined') return;
+  const months = calYearMonths(_calYear);
+  const o = chartBaseOpts({ tooltipCallbacks: {
+    label: ctx => `${ctx.dataset.label}: ${fmt(ctx.raw)}`,
+    footer: items => { const m = months[items[0].dataIndex]; return [`Total pemasukan: ${fmt(m.inTotal)}`, `Total pengeluaran: ${fmt(m.outTotal)}`]; }
+  } });
+  o.scales.x.stacked = true; o.scales.y.stacked = true;
+  o.plugins.legend.position = 'bottom';
+  const ds = (label, key, color, stack) => ({ label, data: months.map(m => m[key]), backgroundColor: color, stack, borderRadius: 3, barPercentage: .8, categoryPercentage: .8 });
+  _charts.calYear = new Chart(cv, { type: 'bar', options: o, data: { labels: MO, datasets: [
+    ds('Pemasukan (riil)',               'inReal',  'rgba(61,219,160,.85)',  'in'),
+    ds('Pemasukan (hutang/piutang)',     'inDebt',  'rgba(255,184,48,.9)',   'in'),
+    ds('Pengeluaran (riil)',             'outReal', 'rgba(255,112,104,.85)', 'out'),
+    ds('Pengeluaran (hutang/piutang)',   'outDebt', 'rgba(251,146,60,.9)',   'out')
+  ] } });
+}
+
+window.setCalView = function(v) { if (v !== 'month' && v !== 'year') return; _calView = v; nav('calendar'); };
+window.calGoMonth = function(i) { _calMonth = i; _calView = 'month'; nav('calendar'); };
+window.calToNow   = function() { const n = new Date(); _calYear = n.getFullYear(); _calMonth = n.getMonth(); nav('calendar'); };
 window.calPrev = function() {
-  _calMonth--;
-  if (_calMonth < 0) { _calMonth = 11; _calYear--; }
+  if (_calView === 'year') _calYear--;
+  else { _calMonth--; if (_calMonth < 0) { _calMonth = 11; _calYear--; } }
   nav('calendar');
 };
 window.calNext = function() {
-  _calMonth++;
-  if (_calMonth > 11) { _calMonth = 0; _calYear++; }
+  if (_calView === 'year') _calYear++;
+  else { _calMonth++; if (_calMonth > 11) { _calMonth = 0; _calYear++; } }
   nav('calendar');
 };
 
@@ -2246,12 +2306,12 @@ window.calDayClick = function(dateStr) {
   });
   const d     = new Date(dateStr + 'T00:00:00');
   const label = d.toLocaleDateString('id-ID', {weekday:'long', day:'numeric', month:'long', year:'numeric'});
-  const realTxns = filterReal(txns);
-  const inc   = sumType(realTxns,'income');
-  const exp   = sumType(realTxns,'expense');
-  const net   = inc - exp;
-  const flowCount = txns.length - realTxns.length;
-  const flowNote = flowCount ? `<div style="font-size:11px;color:var(--txm);margin-bottom:12px"><i class="fa-solid fa-hand-holding-dollar"></i> ${flowCount} transaksi arus kas Hutang/Piutang/Transfer tidak ikut dihitung di ringkasan ini (tetap memengaruhi saldo akun).</div>` : '';
+  const cs    = cashSummary(txns);
+  const inc   = cs.inTotal;
+  const exp   = cs.outTotal;
+  const net   = cs.net;
+  const flowNote = cs.transfer > 0 ? `<div style="font-size:11px;color:var(--txm);margin-bottom:12px"><i class="fa-solid fa-right-left"></i> Transfer antar akun ${fmt(cs.transfer)} tidak dihitung di ringkasan ini (netral).</div>` : '';
+  const chipSub = (real, debt) => `<div style="font-size:9.5px;margin-top:4px;color:var(--txm);line-height:1.35">${debt !== 0 ? `Riil <b>${fmt(real)}</b> · Hutang <b style="color:var(--gold)">${fmt(debt)}</b>` : 'Semuanya riil'}</div>`;
   const dueDebts = S.debts.filter(dt => dt.dueDate === dateStr && debtRemaining(dt) > 0);
   const dueNotice = dueDebts.length ? `
     <div style="padding:12px;border-radius:10px;background:var(--expense-l);margin-bottom:16px">
@@ -2335,19 +2395,19 @@ window.calDayClick = function(dateStr) {
           <div style="font-size:9.5px;font-weight:700;color:var(--income);letter-spacing:.4px;text-transform:uppercase;margin-bottom:4px">
             <i class="fa-solid fa-arrow-down" style="margin-right:3px"></i>Pemasukan
           </div>
-          <div style="font-family:'Outfit';font-size:15px;font-weight:800;color:var(--income)">${fmt(inc)}</div>
+          <div style="font-family:'Outfit';font-size:15px;font-weight:800;color:var(--income)">${fmt(inc)}</div>${chipSub(cs.inReal, cs.inDebt)}
         </div>
         <div style="padding:10px;border-radius:10px;background:var(--expense-l);border:1px solid rgba(255,112,104,0.2);text-align:center">
           <div style="font-size:9.5px;font-weight:700;color:var(--expense);letter-spacing:.4px;text-transform:uppercase;margin-bottom:4px">
             <i class="fa-solid fa-arrow-up" style="margin-right:3px"></i>Pengeluaran
           </div>
-          <div style="font-family:'Outfit';font-size:15px;font-weight:800;color:var(--expense)">${fmt(exp)}</div>
+          <div style="font-family:'Outfit';font-size:15px;font-weight:800;color:var(--expense)">${fmt(exp)}</div>${chipSub(cs.outReal, cs.outDebt)}
         </div>
         <div style="padding:10px;border-radius:10px;background:${net>=0?'var(--income-l)':'var(--expense-l)'};border:1px solid ${net>=0?'rgba(61,219,160,0.2)':'rgba(255,112,104,0.2)'};text-align:center">
           <div style="font-size:9.5px;font-weight:700;color:${net>=0?'var(--income)':'var(--expense)'};letter-spacing:.4px;text-transform:uppercase;margin-bottom:4px">
             <i class="fa-solid fa-scale-balanced" style="margin-right:3px"></i>Net
           </div>
-          <div style="font-family:'Outfit';font-size:15px;font-weight:800;color:${net>=0?'var(--income)':'var(--expense)'}">${net>=0?'+':''}${fmt(net)}</div>
+          <div style="font-family:'Outfit';font-size:15px;font-weight:800;color:${net>=0?'var(--income)':'var(--expense)'}">${net>=0?'+':''}${fmt(net)}</div>${chipSub(cs.netReal, cs.netDebt)}
         </div>
       </div>
 
@@ -2947,7 +3007,7 @@ window.goToKalenderFiltered = function(periodType, key) {
   else if (periodType === 'tahunan') { y=key.y; m=0; }
   else if (periodType === 'harian') { const d=new Date(key.date+'T00:00:00'); y=d.getFullYear(); m=d.getMonth(); dateStr=key.date; }
   else { const d=new Date(key.start+'T00:00:00'); y=d.getFullYear(); m=d.getMonth(); }
-  _calYear = y; _calMonth = m;
+  _calYear = y; _calMonth = m; _calView = periodType === 'tahunan' ? 'year' : 'month';
   closeModal(); nav('calendar');
   if (dateStr) setTimeout(() => calDayClick(dateStr), 120);
 };

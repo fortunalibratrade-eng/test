@@ -1046,3 +1046,31 @@ select.form-input option{background:var(--bg2)}
   border-left:2px solid var(--gold);
 }
 @media(max-width:768px){ .cal-debt-pill{display:none} }
+
+/* ═══════════════════════════════════════════
+   KALENDER — rincian total & tampilan Tahun
+═══════════════════════════════════════════ */
+.cal-sum-sub{font-size:10px;color:var(--txm);margin-top:5px;line-height:1.4}
+.cal-sum-sub b{color:var(--tx2);font-weight:700}
+.cal-sum-sub b.g{color:var(--gold)}
+.cal-legend{font-size:11px;color:var(--txm);margin:-8px 2px 18px;line-height:1.5}
+.cal-legend i{color:var(--acc);margin-right:4px}
+.cal-legend b{color:var(--tx2)}
+.cal-year-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.cal-month-card{
+  padding:14px;border-radius:var(--r-sm);cursor:pointer;background:var(--bg);
+  border:1px solid var(--border);box-shadow:var(--neu-raised-sm);transition:all .2s;
+}
+.cal-month-card:hover{box-shadow:var(--neu-raised);border-color:var(--acc);transform:translateY(-2px)}
+.cal-month-card.now{border-color:var(--acc);background:var(--acc-l)}
+.cal-month-card.empty{opacity:.55}
+.cmc-h{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:9px;font-size:13px}
+.cmc-h span{font-size:10px;color:var(--txm)}
+.cmc-row{display:flex;justify-content:space-between;align-items:baseline;font-size:12px;margin-top:5px;gap:8px}
+.cmc-row span{color:var(--txm);font-size:11px}
+.cmc-row b{font-family:'Outfit';font-weight:800;font-size:13px;white-space:nowrap}
+.cmc-sub{font-size:9.5px;color:var(--gold);text-align:right;margin-top:2px}
+.cmc-net{border-top:1px dashed var(--border);margin-top:8px;padding-top:7px}
+@media(max-width:1024px){ .cal-year-grid{grid-template-columns:repeat(3,1fr)} }
+@media(max-width:640px){ .cal-year-grid{grid-template-columns:repeat(2,1fr)} .cmc-row b{font-size:12px} }
+@media(max-width:400px){ .cal-year-grid{grid-template-columns:1fr} }

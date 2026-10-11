@@ -385,7 +385,33 @@ ok([...FB.store.keys()].filter(k=>k.startsWith('users/u2/')&&/\/(debts|targets|t
   ok(/\+Rp 2\.500\.000 dana pinjaman\/piutang masuk ke akun/.test(dash), 'Dashboard: kartu Pemasukan menyebut Rp 2.500.000 dana pinjaman masuk (bukan pendapatan)');
   ok(/Rincian Total Saldo Rp 0:/.test(dash) && /arus riil[^<]*<b>−Rp 2\.500\.000/.test(dash) && /<b style="color:var\(--gold\)">\+Rp 2\.500\.000/.test(dash), 'Dashboard: rincian = −2,5jt (riil) + 2,5jt (hutang) + 0 (transfer) = Rp 0');
   window.nav('accounts'); ok(/termasuk \+Rp 1\.500\.000 dari hutang\/piutang/.test($('page-content').innerHTML), 'Akun BCA: "termasuk +Rp 1.500.000 dari hutang/piutang"');
-  window.nav('calendar'); ok(/cal-debt-pill/.test($('page-content').innerHTML) && /\+2\.5Jt/.test($('page-content').innerHTML), 'Kalender: pil dana pinjaman +2.5Jt pada tanggalnya');
+  window.setCalView('month'); window.calToNow();
+  { const cal = $('page-content').innerHTML;
+    ok(/Pemasukan<\/div>\s*<div class="cal-sum-value" style="color:var\(--income\)">Rp 2\.500\.000<\/div><div class="cal-sum-sub">Riil <b>Rp 0<\/b> · Hutang\/Piutang <b class="g">Rp 2\.500\.000<\/b>/.test(cal), 'Kalender: PEMASUKAN = total Rp 2.500.000 (Riil Rp 0 · Hutang/Piutang Rp 2.500.000)');
+    ok(/Pengeluaran<\/div>\s*<div class="cal-sum-value" style="color:var\(--expense\)">Rp 2\.500\.000<\/div><div class="cal-sum-sub">Riil <b>Rp 2\.500\.000<\/b>/.test(cal) || /Pengeluaran<\/div>\s*<div class="cal-sum-value" style="color:var\(--expense\)">Rp 2\.500\.000<\/div><div class="cal-sum-sub">Semuanya arus riil/.test(cal), 'Kalender: PENGELUARAN = total Rp 2.500.000 (UKT, riil)');
+    ok(/Transfer antar akun Rp 1\.000\.000 tidak dihitung/.test(cal), 'Kalender: keterangan transfer Rp 1.000.000 (netral, tidak dihitung)');
+    ok(/cal-income-pill[^>]*>[^<]*<i[^>]*><\/i>2\.5Jt/.test(cal) && /↳ hutang 2\.5Jt/.test(cal), 'Kalender sel hari: pil pemasukan TOTAL 2.5Jt + keterangan "↳ hutang 2.5Jt"');
+  }
+  window.calDayClick(t0); { const md = $('modal-box').innerHTML;
+    ok(/Pemasukan[\s\S]{0,200}Rp 2\.500\.000[\s\S]{0,120}Hutang <b style="color:var\(--gold\)">Rp 2\.500\.000/.test(md), 'Modal hari: pemasukan total Rp 2.500.000 + rincian hutang Rp 2.500.000'); }
+  // tampilan TAHUN
+  window.setCalView('year'); { const yr = $('page-content').innerHTML, Y = new Date().getFullYear();
+    ok(new RegExp('Tahun '+Y).test(yr) && /cal-year-grid/.test(yr) && /Rincian per Bulan/.test(yr) && /id="ch-cal-year"/.test(yr), 'Kalender Tahun: judul, kartu 12 bulan, tabel rincian, kanvas grafik');
+    ok(/Pemasukan<\/div>\s*<div class="cal-sum-value" style="color:var\(--income\)">Rp 2\.500\.000/.test(yr), 'Kalender Tahun: total pemasukan setahun = Rp 2.500.000');
+    const ms = X.calYearMonths(Y), yrs = X.cashSummary(S().transactions.filter(t=>t.date.startsWith(String(Y))));
+    eq([ms.reduce((s,m)=>s+m.inTotal,0), ms.reduce((s,m)=>s+m.outTotal,0)], [yrs.inTotal, yrs.outTotal], 'Tahun: jumlah 12 bulan = total tahunan (pemasukan & pengeluaran)');
+    eq(ms.reduce((s,m)=>s+m.inReal,0)+ms.reduce((s,m)=>s+m.inDebt,0), yrs.inTotal, 'Tahun: riil + hutang = total pemasukan');
+    globalThis.Chart = class { constructor(el,cfg){ globalThis.__cc = cfg; } destroy(){} };
+    const _raf = globalThis.requestAnimationFrame; globalThis.requestAnimationFrame = cb => setTimeout(cb, 0);
+    window.nav('calendar'); await new Promise(r=>setTimeout(r,200)); globalThis.requestAnimationFrame = _raf;
+    const cc = globalThis.__cc; ok(cc && cc.type==='bar' && cc.data.datasets.length===4 && cc.data.labels.length===12, 'Grafik tahunan: 4 dataset (masuk/keluar × riil/hutang) × 12 bulan');
+    ok(cc.data.datasets[0].stack==='in' && cc.data.datasets[2].stack==='out' && cc.options.scales.x.stacked===true, 'Grafik tahunan: dua tumpukan (pemasukan | pengeluaran)');
+    const mi = new Date().getMonth(); eq(cc.data.datasets[1].data[mi], 2500000, 'Grafik tahunan: bagian hutang bulan ini = 2.500.000');
+    delete globalThis.Chart;
+    window.calPrev(); ok(new RegExp('Tahun '+(Y-1)).test($('page-content').innerHTML), 'Tahun: tombol sebelumnya → tahun lalu'); window.calToNow();
+    window.calGoMonth(0); ok(!/cal-year-grid/.test($('page-content').innerHTML) && /cal-cells/.test($('page-content').innerHTML), 'klik bulan di tampilan Tahun → buka kalender bulan itu');
+  }
+  window.calToNow(); window.setCalView('month');
   window.nav('transactions'); window.clearTxnChip('range'); X.fillTxnTable(); const tb = $('txn-tb').innerHTML;
   ok(/Dana Pinjaman Masuk/.test(tb) && /Transfer/.test(tb), 'Transaksi: lencana "Dana Pinjaman Masuk" & "Transfer" jelas');
   const ai = X.computeAIAnalysis(); ok(ai.risks.some(r=>/dibiayai dari hutang/.test(r)), 'AI: menjelaskan defisit dibiayai dana pinjaman (bukan sekadar "arus kas negatif")');
